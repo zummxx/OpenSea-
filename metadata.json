@@ -1,0 +1,6 @@
+{
+  "name": "OSNM-Z 架构与工具解析",
+  "description": "OpenSea NFT Minter by Zun (OSNM-Z) 核心抢购与代付实操测试控制台",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
