@@ -27,6 +27,7 @@ import {
   Eye,
   EyeOff,
   Gauge,
+  Fuel,
   Settings,
   Radio,
   CheckCheck,
@@ -46,42 +47,13 @@ import {
   generateCryptographicWallets,
   executeRealMulticallFund,
   executeRealWithdrawFunds,
+  executeRealOnChainMint,
   getPublicClient
 } from '../utils/web3Service';
-
-export interface TestWallet {
-  id: number;
-  address: string;
-  privateKey: string;
-  quantity: number;
-  nativeBalance: number;
-  isDelegated: boolean; // EIP-7702 delegated
-  status: 'idle' | 'ready' | 'fetching_calldata' | 'broadcasting' | 'success' | 'reverted';
-  txHash?: string;
-  mintedNftCount: number;
-  errorMsg?: string;
-}
-
-interface LogEntry {
-  timestamp: string;
-  level: 'info' | 'warn' | 'error' | 'success' | 'cmd';
-  message: string;
-}
-
-export interface NetworkConfig {
-  id: string;
-  name: string;
-  chainId: number;
-  currency: string;
-  defaultRpcUrl: string;
-  explorerUrl: string;
-  supports7702: boolean;
-  supports1153: boolean;
-  isTestnet?: boolean;
-  badgeColor: string;
-  blockTimeSec: number;
-  avgGasGwei: number;
-}
+import { TestWallet, LogEntry, NetworkConfig, DropInfo } from '../types';
+import { WalletsFundPanel } from './WalletsFundPanel';
+import { WorkbenchPanel } from './WorkbenchPanel';
+import { TerminalPanel } from './TerminalPanel';
 
 const SUPPORTED_NETWORKS: NetworkConfig[] = [
   {
@@ -95,7 +67,8 @@ const SUPPORTED_NETWORKS: NetworkConfig[] = [
     supports1153: true,
     badgeColor: 'bg-blue-500/10 text-blue-400 border-blue-500/30',
     blockTimeSec: 12,
-    avgGasGwei: 18.5
+    avgGasGwei: 18.5,
+    minGasGwei: 1
   },
   {
     id: 'robinhood',
@@ -128,13 +101,14 @@ const SUPPORTED_NETWORKS: NetworkConfig[] = [
     name: 'Arc Mainnet',
     chainId: 5042,
     currency: 'USDC', // Arc uses USDC as native gas
-    defaultRpcUrl: 'https://rpc.mainnet.arc.io',
-    explorerUrl: 'https://arcscan.app',
+    defaultRpcUrl: 'https://rpc.arc-scan.org', // arc-scan.org 官方配套 RPC 节点 (免 Key 极速响应)
+    explorerUrl: 'https://arc-scan.org', // arc-scan.org 官方区块浏览器
     supports7702: false,
     supports1153: true,
     badgeColor: 'bg-sky-500/10 text-sky-400 border-sky-500/30',
     blockTimeSec: 1,
-    avgGasGwei: 0.05
+    avgGasGwei: 20, // Arc 最低 Gas 为 20 Gwei
+    minGasGwei: 20 // 强制底层 Gas 下限保护
   }
 ];
 
@@ -152,9 +126,7 @@ const INITIAL_CRYPTO_WALLETS: TestWallet[] = generateCryptographicWallets(3).map
 
 export const InteractiveTester: React.FC = () => {
   const [activeSubTab, setActiveSubTab] = useState<'mint' | 'doctor' | 'wallets' | 'executor' | 'calldata'>('mint');
-
-  // Execution Mode: 'real' (Default live on-chain) vs 'simulation' (Sandbox dry-run)
-  const [executionMode, setExecutionMode] = useState<'real' | 'simulation'>('real');
+  const [panelLayout, setPanelLayout] = useState<'workbench_center' | 'terminal_center'>('workbench_center');
 
   // Network & RPC State
   const [selectedNetworkId, setSelectedNetworkId] = useState<string>('eth');
@@ -176,8 +148,19 @@ export const InteractiveTester: React.FC = () => {
     checkedAt: '刚刚'
   });
 
+  const normalizeRpcUrl = (url: string) => {
+    let trimmed = url.trim();
+    if (!trimmed) return '';
+    // arc-scan.org is the block explorer web frontend with Cloudflare protection;
+    // its corresponding JSON-RPC endpoint is https://rpc.arc-scan.org
+    if (trimmed.includes('arc-scan.org') && !trimmed.includes('rpc.arc-scan.org')) {
+      return 'https://rpc.arc-scan.org';
+    }
+    return trimmed.startsWith('http://') || trimmed.startsWith('https://') ? trimmed : `https://${trimmed}`;
+  };
+
   const activeNetwork = SUPPORTED_NETWORKS.find((n) => n.id === selectedNetworkId) || SUPPORTED_NETWORKS[0];
-  const effectiveRpcUrl = useCustomRpc && customRpcUrl.trim() ? customRpcUrl.trim() : activeNetwork.defaultRpcUrl;
+  const effectiveRpcUrl = useCustomRpc && customRpcUrl.trim() ? normalizeRpcUrl(customRpcUrl) : activeNetwork.defaultRpcUrl;
 
   // Browser Web3 Wallet & Key State
   const [browserWallet, setBrowserWallet] = useState<{
@@ -200,9 +183,9 @@ export const InteractiveTester: React.FC = () => {
   // Wallets State - generated with genuine cryptography
   const [wallets, setWallets] = useState<TestWallet[]>(INITIAL_CRYPTO_WALLETS);
 
-  // Master Addresses & Balances
-  const [sponsorAddress, setSponsorAddress] = useState('0x8888b6038BeF89A52e0f43818e33F7D5F34E8888');
-  const [recipientAddress, setRecipientAddress] = useState('0x9999a071850BE9048a127a92A1e2fa0635Ac9999');
+  // Master Addresses & Balances (Default to empty to ensure user enters genuine addresses)
+  const [sponsorAddress, setSponsorAddress] = useState('');
+  const [recipientAddress, setRecipientAddress] = useState('');
   const [sponsorBalance, setSponsorBalance] = useState(0.0);
   const [recipientNftCount, setRecipientNftCount] = useState(0);
 
@@ -215,7 +198,6 @@ export const InteractiveTester: React.FC = () => {
     mintPrice: 0.005,
     activeStage: 'WL & Allowlist'
   });
-  const [simulatePartialRevert, setSimulatePartialRevert] = useState(true);
   const [isMintRunning, setIsMintRunning] = useState(false);
   const [mintProgress, setMintProgress] = useState(0);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -306,12 +288,16 @@ export const InteractiveTester: React.FC = () => {
 
   // Test Real RPC Ping
   const testRpcPing = async (targetUrl: string) => {
+    let resolvedUrl = normalizeRpcUrl(targetUrl);
+    if (targetUrl.includes('arc-scan.org') && !targetUrl.includes('rpc.arc-scan.org')) {
+      addLog('info', `[智能路由] arc-scan.org 页面受 Cloudflare 保护，已自动切换至配套的区块链 RPC: https://rpc.arc-scan.org`);
+    }
     setRpcPingState((prev) => ({ ...prev, status: 'testing' }));
-    addLog('cmd', `$ opensea-mint test-rpc --url ${targetUrl.slice(0, 26)}...`);
+    addLog('cmd', `$ opensea-mint test-rpc --url ${resolvedUrl.slice(0, 28)}...`);
 
     const startTime = Date.now();
     try {
-      const client = getPublicClient(targetUrl, activeNetwork.chainId);
+      const client = getPublicClient(resolvedUrl, activeNetwork.chainId);
       const [blockNum, gasPrice] = await Promise.all([
         client.getBlockNumber(),
         client.getGasPrice().catch(() => 0n)
@@ -331,6 +317,32 @@ export const InteractiveTester: React.FC = () => {
     } catch (err: unknown) {
       const latency = Date.now() - startTime;
       const errMsg = err instanceof Error ? err.message : String(err);
+
+      // If user provided Infura URL without API key (e.g. arc-mainnet.infura.io without /v3/<KEY>)
+      if (targetUrl.includes('infura.io') && !targetUrl.includes('/v3/')) {
+        addLog('warn', `[Infura 专线提示] Infura 节点必须包含 API Key 路径: https://arc-mainnet.infura.io/v3/<YOUR_KEY>。直接请求根路径会被 Infura 返回 404 拒绝。`);
+        addLog('info', `[智能容灾] 正在自动切换至 Arc 官方免 Key 高可用公共节点 (https://rpc.mainnet.arc.io)...`);
+
+        try {
+          const fallbackUrl = 'https://rpc.mainnet.arc.io';
+          const client = getPublicClient(fallbackUrl, activeNetwork.chainId);
+          const [blockNum, gasPrice] = await Promise.all([
+            client.getBlockNumber(),
+            client.getGasPrice().catch(() => 0n)
+          ]);
+          setRpcPingState({
+            status: 'success',
+            latencyMs: Date.now() - startTime,
+            blockNumber: Number(blockNum),
+            checkedAt: new Date().toTimeString().split(' ')[0]
+          });
+          addLog('success', `[容灾成功] 官方公共 RPC 连接就绪: 区块 #${blockNum.toString()} | Gas: ${(Number(gasPrice) / 1e9).toFixed(2)} Gwei`);
+          return;
+        } catch {
+          // continue to set error if fallback also fails
+        }
+      }
+
       setRpcPingState({
         status: 'error',
         latencyMs: latency,
@@ -398,7 +410,7 @@ export const InteractiveTester: React.FC = () => {
     if (net) {
       addLog('info', `切换测试网络至: ${net.name} (Chain ID: ${net.chainId}, 原生 Gas 代币: ${net.currency})`);
       if (net.id === 'arc') {
-        addLog('warn', `【Arc 稳定币公链特性】Arc 采用 Circle 原生 USDC 作为网络 Gas (18 精度)，单笔交易 Gas 成本平稳固定 (平均仅约 0.004 USDC)！`);
+        addLog('warn', `【Arc 稳定币公链特性】Arc 采用 Circle 原生 USDC 作为网络 Gas (18 精度)，强制最低 Gas 费率底线为 20 Gwei (单笔转账 21,000 Gas 仅需 0.00042 USDC)！底层交易已锁定 ≥20 Gwei 防拒付。`);
         if (fundAmountPerWallet === 0.01) {
           setFundAmountPerWallet(1.0);
         }
@@ -412,7 +424,8 @@ export const InteractiveTester: React.FC = () => {
       } else {
         addLog('warn', `[提示] ${net.name} 未激活 Prague 升级，建议使用自费并发抢购模式`);
       }
-      testRpcPing(useCustomRpc && customRpcUrl ? customRpcUrl : net.defaultRpcUrl);
+      const targetRpc = useCustomRpc && customRpcUrl.trim() ? normalizeRpcUrl(customRpcUrl) : net.defaultRpcUrl;
+      testRpcPing(targetRpc);
     }
   };
 
@@ -432,7 +445,13 @@ export const InteractiveTester: React.FC = () => {
       ]);
 
       const rpcOk = blockNum > 0n;
-      addLog(rpcOk ? 'success' : 'error', `[PASS] 真实 RPC 响应: 区块高度 #${blockNum.toString()}，实时 Gas 价格: ${(Number(gasPrice) / 1e9).toFixed(2)} Gwei`);
+      const gasGwei = Number(gasPrice) / 1e9;
+      const minGasFloor = activeNetwork.minGasGwei || 0;
+      const effectiveGasGwei = Math.max(gasGwei, minGasFloor);
+      const gasNote = minGasFloor > 0 && gasGwei < minGasFloor
+        ? ` (链上 RPC 报告 ${gasGwei.toFixed(2)} Gwei，系统已按 ${activeNetwork.name} 最低下限 ${minGasFloor} Gwei 安全锁定)`
+        : '';
+      addLog(rpcOk ? 'success' : 'error', `[PASS] 真实 RPC 响应: 区块高度 #${blockNum.toString()}，生效 Gas 价格: ${effectiveGasGwei.toFixed(2)} Gwei${gasNote}`);
 
       if (isMulticallDeployed) {
         addLog('success', `[PASS] Multicall3 链上验证通过: 已在主网地址 ${MULTICALL3_ADDRESS} 部署就绪`);
@@ -513,29 +532,7 @@ export const InteractiveTester: React.FC = () => {
     const totalNeeded = fundAmountPerWallet * wallets.length;
     addLog('cmd', `$ opensea-mint mint --fund ${fundAmountPerWallet}`);
 
-    if (executionMode === 'simulation') {
-      // Simulation mode
-      if (sponsorBalance < totalNeeded) {
-        addLog('error', `【沙盒警告】赞助钱包余额不足！需 ${totalNeeded} ${activeNetwork.currency}，当前仅有 ${sponsorBalance} ${activeNetwork.currency}`);
-        return;
-      }
-      setIsFunding(true);
-      addLog('info', `[沙盒仿真] 准备通过 Multicall3 (${MULTICALL3_ADDRESS}) 批量打包 ${wallets.length} 笔资金原子分发...`);
-      setTimeout(() => {
-        setSponsorBalance((prev) => parseFloat((prev - totalNeeded - 0.0008).toFixed(4)));
-        setWallets((prev) =>
-          prev.map((w) => ({
-            ...w,
-            nativeBalance: parseFloat((w.nativeBalance + fundAmountPerWallet).toFixed(4))
-          }))
-        );
-        setIsFunding(false);
-        addLog('success', `[沙盒确认] Multicall3 模拟充值成功！共向 ${wallets.length} 个钱包分发 ${totalNeeded.toFixed(4)} ${activeNetwork.currency}。`);
-      }, 800);
-      return;
-    }
-
-    // REAL ON-CHAIN MODE
+    // 100% REAL ON-CHAIN MODE
     setIsFunding(true);
     addLog('warn', `【主网真实执行】准备向 ${activeNetwork.name} 广播真实 Multicall3 原子充值交易...`);
     addLog('info', `分发清单: 共 ${wallets.length} 个钱包，每钱包 ${fundAmountPerWallet} ${activeNetwork.currency}，总计 ${totalNeeded.toFixed(4)} ${activeNetwork.currency}`);
@@ -567,29 +564,9 @@ export const InteractiveTester: React.FC = () => {
     }
   };
 
-  // Withdraw - Real On-Chain / Simulation
+  // Withdraw - 100% Real On-Chain
   const handleWithdrawFunds = async () => {
     addLog('cmd', '$ opensea-mint mint --withdraw');
-
-    if (executionMode === 'simulation') {
-      addLog('info', '[沙盒仿真] 正在为各子钱包核算归集 Gas (21,000 gas * 当前 BaseFee)...');
-      setTimeout(() => {
-        let recovered = 0;
-        setWallets((prev) =>
-          prev.map((w) => {
-            const ret = Math.max(0, w.nativeBalance - 0.00015);
-            recovered += ret;
-            return {
-              ...w,
-              nativeBalance: 0
-            };
-          })
-        );
-        setSponsorBalance((prev) => parseFloat((prev + recovered).toFixed(4)));
-        addLog('success', `[沙盒确认] 资金归集完成！回收 ${recovered.toFixed(4)} ${activeNetwork.currency} 至主代付钱包。`);
-      }, 700);
-      return;
-    }
 
     // REAL ON-CHAIN WITHDRAW
     setIsWithdrawing(true);
@@ -652,116 +629,124 @@ export const InteractiveTester: React.FC = () => {
     }, 900);
   };
 
-  // Deploy Executor
-  const handleDeployExecutor = () => {
+  // Verify or Deploy Executor on Real Chain
+  const handleDeployExecutor = async () => {
     addLog('cmd', '$ opensea-mint deploy-executor');
-    addLog('info', '基于确定性 CREATE2 部署工厂 (0x4e59b44847b379578588920cA78FbF26c0B4956C)...');
-    
-    setTimeout(() => {
-      setExecutorDeployed(true);
-      addLog('success', `[OK] 专属 SponsoredMintExecutor 部署就绪: ${calcExecutorAddress}`);
-      addLog('info', '已校验字节码运行时哈希: 0x81a86fad69bf234bc98b7dc3f8c853e07bc... (完全匹配)');
-    }, 800);
+    addLog('info', `正在向 ${activeNetwork.name} RPC 查询 CREATE2 执行器 (${calcExecutorAddress.slice(0, 10)}...) 链上部署状态...`);
+    try {
+      const publicClient = getPublicClient(effectiveRpcUrl, activeNetwork.chainId);
+      const code = await publicClient.getBytecode({ address: calcExecutorAddress as `0x${string}` });
+      if (code && code !== '0x' && code.length > 2) {
+        setExecutorDeployed(true);
+        addLog('success', `[链上核验通过] 专属 SponsoredMintExecutor 在 ${activeNetwork.name} 上已就绪！地址: ${calcExecutorAddress}`);
+      } else {
+        setExecutorDeployed(false);
+        addLog('warn', `[链上状态] 合约 ${calcExecutorAddress} 当前在该链尚未部署字节码。`);
+      }
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      addLog('error', `RPC 查询失败: ${errMsg}`);
+    }
   };
 
-  // Mint Simulation
-  const startMintSimulation = (fastCountdown = true) => {
+  // 100% REAL ON-CHAIN MINT EXECUTION - NO SIMULATION
+  const startRealMintExecution = async () => {
     if (wallets.length === 0) {
       addLog('error', '请先在「钱包管理」中创建至少 1 个测试钱包！');
       return;
     }
 
     setIsMintRunning(true);
-    setMintProgress(5);
-    addLog('cmd', `$ opensea-mint mint --collection ${selectedDrop.collectionSlug}`);
-    addLog('info', `目标链: ${activeNetwork.name} | 节点: ${effectiveRpcUrl.slice(0, 28)}...`);
+    setMintProgress(10);
+    addLog('cmd', `$ opensea-mint mint --collection ${selectedDrop.collectionSlug} --contract ${selectedDrop.contractAddress} --real-broadcast`);
+    addLog('info', `目标链: ${activeNetwork.name} | 节点: ${effectiveRpcUrl}`);
     addLog('info', `抢购模式: ${mintMode === 'sponsored' ? 'EIP-7702 赞助代付模式' : mintMode === 'self_funded' ? '自费多钱包并发模式' : '单钱包模式'}`);
 
-    // T-15s
-    setCountdownSeconds(fastCountdown ? 3 : 15);
-    addLog('info', '【T-15s 状态机】锁定 Nonce，检查子钱包本地签名凭证，验证 EIP-712 授权结构体...');
+    // Step 1: Real on-chain check
+    setWallets((prev) => prev.map((w) => ({ ...w, status: 'ready', errorMsg: undefined })));
+    addLog('info', '【真实链上核验】检查各子钱包真实 Nonce、私钥签名凭证与目标合约部署状态...');
 
-    setWallets((prev) =>
-      prev.map((w) => ({
-        ...w,
-        status: 'ready'
-      }))
-    );
+    try {
+      setMintProgress(35);
+      setWallets((prev) => prev.map((w) => ({ ...w, status: 'fetching_calldata' })));
+      addLog('warn', `【主网广播准备】正在核验 ${wallets.length} 个子钱包链上真实余额与 Gas 储备...`);
 
-    setTimeout(() => {
-      // T-2s
-      setCountdownSeconds(fastCountdown ? 1 : 2);
-      setMintProgress(40);
-      addLog('info', '【T-2s 状态机】触发 OpenSea GraphQL 别名聚合热请求，一次性抓取全部钱包专属 Mint Calldata...');
+      // Call executeRealOnChainMint for genuine on-chain execution
+      const mintRes = await executeRealOnChainMint({
+        rpcUrl: effectiveRpcUrl,
+        chainId: activeNetwork.chainId,
+        chainName: activeNetwork.name,
+        currency: activeNetwork.currency,
+        contractAddress: selectedDrop.contractAddress,
+        mintPrice: selectedDrop.mintPrice,
+        wallets: wallets.map((w) => ({
+          address: w.address,
+          privateKey: w.privateKey,
+          quantity: w.quantity
+        })),
+        onStatusUpdate: (msg) => addLog('info', msg)
+      });
 
+      setMintProgress(85);
+      let totalMinted = 0;
+
+      setWallets((prev) =>
+        prev.map((w) => {
+          const resItem = mintRes.results.find((r) => r.address.toLowerCase() === w.address.toLowerCase());
+          if (!resItem) return w;
+          if (resItem.success) {
+            totalMinted += resItem.mintedCount;
+            return {
+              ...w,
+              status: 'success',
+              mintedNftCount: w.mintedNftCount + resItem.mintedCount,
+              txHash: resItem.txHash,
+              errorMsg: undefined
+            };
+          } else {
+            return {
+              ...w,
+              status: 'reverted',
+              errorMsg: resItem.error || '链上执行失败'
+            };
+          }
+        })
+      );
+
+      setMintProgress(100);
+
+      mintRes.results.forEach((r) => {
+        if (r.success) {
+          addLog('success', `[主网确认] 钱包 ${r.address.slice(0, 8)}... 真实铸造成功！哈希: ${r.txHash}`);
+          addLog('info', `区块浏览器凭证: ${activeNetwork.explorerUrl}/tx/${r.txHash}`);
+        } else {
+          addLog('error', `[链上拒绝] 钱包 ${r.address.slice(0, 8)}...: ${r.error}`);
+        }
+      });
+
+      if (totalMinted > 0) {
+        setRecipientNftCount((prev) => prev + totalMinted);
+        addLog('success', `🎉 真实抢购执行完毕！共成功铸造 ${totalMinted} 枚 NFT！所有交易哈希均真实上链，可通过区块浏览器实时审计。`);
+      } else {
+        addLog('warn', '⚠️ 本次抢购未产生有效上链铸造（各钱包未满足合约前提条件或余额不足）。已完整记录真实链上返回信息。');
+      }
+
+      // Sync latest real balances from chain
+      await syncAllBalances();
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      addLog('error', `❌ 真实抢购中断: ${errMsg}`);
       setWallets((prev) =>
         prev.map((w) => ({
           ...w,
-          status: 'fetching_calldata'
+          status: 'reverted',
+          errorMsg: errMsg.slice(0, 80)
         }))
       );
-
-      setTimeout(() => {
-        // T-0s
-        setCountdownSeconds(0);
-        setMintProgress(75);
-        addLog('warn', `【T-0s 状态机】倒计时归零！抢购通道开启，向 ${activeNetwork.name} 内存池瞬间并发广播！`);
-
-        setWallets((prev) =>
-          prev.map((w) => ({
-            ...w,
-            status: 'broadcasting'
-          }))
-        );
-
-        setTimeout(() => {
-          setMintProgress(100);
-          setIsMintRunning(false);
-          setCountdownSeconds(null);
-
-          let totalNewNfts = 0;
-
-          setWallets((prev) =>
-            prev.map((w, idx) => {
-              if (simulatePartialRevert && idx === 1 && prev.length > 1) {
-                return {
-                  ...w,
-                  status: 'reverted',
-                  errorMsg: 'SeaDrop: AllowlistExceeded (单点失败已被隔离)'
-                };
-              }
-
-              const nfts = w.quantity;
-              totalNewNfts += nfts;
-              const fakeHash = '0x' + Math.random().toString(16).slice(2, 10) + '...' + Math.random().toString(16).slice(2, 6);
-
-              return {
-                ...w,
-                status: 'success',
-                mintedNftCount: w.mintedNftCount + nfts,
-                txHash: fakeHash,
-                nativeBalance: mintMode === 'sponsored' ? w.nativeBalance : Math.max(0, w.nativeBalance - (selectedDrop.mintPrice * nfts + 0.0005))
-              };
-            })
-          );
-
-          if (mintMode === 'sponsored') {
-            setSponsorBalance((prev) => parseFloat((prev - 0.0015 - (selectedDrop.mintPrice * totalNewNfts)).toFixed(4)));
-            setRecipientNftCount((prev) => prev + totalNewNfts);
-            addLog('success', `【EIP-7702 原子归集】SeaDrop _safeMint 触发回调，已直接原子转移 ${totalNewNfts} 枚 NFT 至主钱包 ${recipientAddress.slice(0, 8)}...！`);
-          } else {
-            setRecipientNftCount((prev) => prev + totalNewNfts);
-            addLog('success', `【自费并发归集】各子钱包抢购确认，并自动执行 safeTransferFrom 将 ${totalNewNfts} 枚 NFT 转移至主接收钱包！`);
-          }
-
-          if (simulatePartialRevert && wallets.length > 1) {
-            addLog('warn', '【单点隔离验证】钱包 #2 遭遇限购回滚，合约 try-catch 隔离成功，其余钱包 100% 成功铸造！');
-          }
-
-          addLog('success', '🎉 抢购流程执行完毕，已完成链上凭证审计。');
-        }, 1300);
-      }, 1000);
-    }, 1100);
+    } finally {
+      setIsMintRunning(false);
+      setCountdownSeconds(null);
+    }
   };
 
   const copyWalletsJson = () => {
@@ -783,18 +768,20 @@ export const InteractiveTester: React.FC = () => {
   return (
     <div className="space-y-6">
       {/* 1. TOP STATUS & NETWORK/RPC BAR */}
-      <div className="bg-slate-900 rounded-2xl border border-slate-800 p-4 sm:p-5 shadow-sm space-y-4">
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-          {/* Left: Engine & Chain Info */}
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="flex items-center space-x-2 bg-slate-800/90 px-3 py-1.5 rounded-xl border border-slate-700/80">
-              <Globe className="w-4 h-4 text-emerald-400" />
-              <span className="text-xs text-slate-400">网络:</span>
+      <div className="bg-slate-900 rounded-2xl border border-slate-800/90 p-3.5 sm:p-4 shadow-sm space-y-3.5">
+        {/* Top Tier: Network, RPC Telemetry & Actions Hub */}
+        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3">
+          {/* Left Block: Chain, RPC Node & Telemetry Integrated Strip */}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Network Selector */}
+            <div className="flex items-center space-x-2 bg-slate-950/80 px-3 h-9 rounded-xl border border-slate-800 hover:border-slate-700 transition-colors">
+              <Globe className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span className="text-[11px] font-medium text-slate-400 shrink-0">网络:</span>
               <select
                 id="select-network"
                 value={selectedNetworkId}
                 onChange={(e) => handleNetworkChange(e.target.value)}
-                className="bg-transparent text-xs font-bold text-white focus:outline-none cursor-pointer"
+                className="bg-transparent text-xs font-semibold text-white focus:outline-none cursor-pointer pr-1"
               >
                 {SUPPORTED_NETWORKS.map((n) => (
                   <option key={n.id} value={n.id} className="bg-slate-900 text-slate-100">
@@ -804,65 +791,98 @@ export const InteractiveTester: React.FC = () => {
               </select>
             </div>
 
-            <div className="flex items-center space-x-2 bg-slate-800/90 px-3 py-1.5 rounded-xl border border-slate-700/80">
-              <Server className="w-4 h-4 text-indigo-400" />
-              <span className="text-xs text-slate-400">RPC 节点:</span>
-              <span className="text-xs font-mono text-slate-200 max-w-[160px] sm:max-w-[220px] truncate" title={effectiveRpcUrl}>
-                {useCustomRpc && customRpcUrl ? '私人 RPC (已激活)' : effectiveRpcUrl}
+            {/* RPC Endpoint & Settings */}
+            <div className="flex items-center space-x-2 bg-slate-950/80 px-3 h-9 rounded-xl border border-slate-800 hover:border-slate-700 transition-colors">
+              <Server className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+              <span className="text-[11px] font-medium text-slate-400 shrink-0">RPC:</span>
+              <span className="text-xs font-mono text-slate-200 max-w-[150px] sm:max-w-[210px] truncate" title={effectiveRpcUrl}>
+                {useCustomRpc && customRpcUrl ? '私人节点 (已激活)' : effectiveRpcUrl}
               </span>
               <button
                 id="btn-open-rpc-modal"
                 onClick={() => setRpcModalOpen(true)}
-                className="text-[11px] text-emerald-400 hover:text-emerald-300 font-bold ml-1 flex items-center space-x-1 cursor-pointer underline underline-offset-2"
+                className="text-[11px] text-emerald-400 hover:text-emerald-300 font-bold ml-1 flex items-center space-x-1 cursor-pointer bg-emerald-950/60 hover:bg-emerald-900/60 px-1.5 py-0.5 rounded border border-emerald-500/30 transition-colors"
+                title="配置或更换 RPC 节点"
               >
                 <Settings className="w-3 h-3" />
                 <span>设置</span>
               </button>
             </div>
 
-            {/* Ping Chip */}
-            <div className="flex items-center space-x-1.5 bg-slate-800/90 px-3 py-1.5 rounded-xl border border-slate-700/80 text-xs font-mono">
-              <Wifi className={`w-3.5 h-3.5 ${rpcPingState.latencyMs < 30 ? 'text-emerald-400' : 'text-amber-400'}`} />
-              <span className="text-slate-400">延迟:</span>
-              <span className="text-emerald-400 font-bold">{rpcPingState.latencyMs}ms</span>
+            {/* Telemetry Metrics (Latency & Gas Floor unified chip) */}
+            <div className="flex items-center space-x-2.5 bg-slate-950/80 px-3 h-9 rounded-xl border border-slate-800 text-xs font-mono">
+              {/* Latency */}
+              <div className="flex items-center space-x-1" title="RPC 响应延迟">
+                <Wifi className={`w-3.5 h-3.5 ${rpcPingState.latencyMs < 30 ? 'text-emerald-400' : 'text-amber-400'}`} />
+                <span className="text-[11px] text-slate-400">延迟:</span>
+                <span className="text-emerald-400 font-bold">{rpcPingState.latencyMs}ms</span>
+              </div>
+
+              <span className="text-slate-700">|</span>
+
+              {/* Gas Floor */}
+              <div
+                className="flex items-center space-x-1"
+                title={activeNetwork.id === 'arc' ? 'Arc 官方强制最低 Gas: 20 Gwei (USDC)' : `网络基准 Gas: ~${activeNetwork.avgGasGwei} Gwei`}
+              >
+                <Fuel className="w-3.5 h-3.5 text-sky-400" />
+                <span className="text-[11px] text-slate-400">最低Gas:</span>
+                <span className={`font-bold ${activeNetwork.id === 'arc' ? 'text-sky-300' : 'text-slate-200'}`}>
+                  {activeNetwork.id === 'arc' ? '20 Gwei' : `${activeNetwork.avgGasGwei} Gwei`}
+                </span>
+              </div>
             </div>
           </div>
 
-          {/* Right: Mode Toggle & Web3 Wallet & Quick Action Controls */}
-          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-            {/* Mode Switcher */}
-            <div className="flex items-center space-x-1 bg-slate-800/90 p-1 rounded-xl border border-slate-700/80 text-xs">
+          {/* Right Block: On-chain Status, Action Buttons & Web3 Wallet */}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* 100% Real On-Chain Badge */}
+            <div className="flex items-center space-x-1.5 bg-emerald-950/60 px-2.5 h-9 rounded-xl border border-emerald-500/40 text-xs">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              <span className="font-bold text-emerald-300 text-xs">100% 真实主网</span>
+              <span className="text-[10px] text-emerald-400/90 bg-emerald-900/60 px-1.5 py-0.5 rounded font-mono hidden sm:inline">
+                全真哈希
+              </span>
+            </div>
+
+            {/* Quick Action Tools Group */}
+            <div className="flex items-center space-x-1.5">
+              {/* Sync Balances */}
               <button
-                id="btn-mode-real"
-                onClick={() => {
-                  setExecutionMode('real');
-                  addLog('warn', '【执行模式切换】已启用「主网真实链上模式」，Multicall3 充值与归集将通过真实链上 RPC 执行！');
-                }}
-                className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center space-x-1.5 transition-all cursor-pointer ${
-                  executionMode === 'real'
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-                title="真实链上交互，拒绝模拟假数据"
+                id="btn-sync-balances"
+                onClick={syncAllBalances}
+                disabled={isSyncingBalances}
+                className="h-9 px-2.5 rounded-xl bg-slate-800/90 hover:bg-slate-700/90 text-slate-200 border border-slate-700 text-xs font-medium flex items-center space-x-1.5 cursor-pointer transition-all active:scale-95"
+                title="从链上实时抓取所有钱包最新余额"
               >
-                <span className="w-2 h-2 rounded-full bg-emerald-300 animate-pulse" />
-                <span>主网真实链上</span>
+                <RefreshCw className={`w-3.5 h-3.5 ${isSyncingBalances ? 'animate-spin text-emerald-400' : 'text-slate-400'}`} />
+                <span className="hidden sm:inline">{isSyncingBalances ? '同步中' : '同步余额'}</span>
               </button>
+
+              {/* Ping */}
               <button
-                id="btn-mode-simulation"
-                onClick={() => {
-                  setExecutionMode('simulation');
-                  addLog('info', '【执行模式切换】已切入「沙盒无损仿真」，仅本地内存模拟，不上链。');
-                }}
-                className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center space-x-1.5 transition-all cursor-pointer ${
-                  executionMode === 'simulation'
-                    ? 'bg-amber-600 text-white shadow-xs'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-                title="本地仿真，无 Gas 成本"
+                id="btn-ping-rpc"
+                onClick={() => testRpcPing(effectiveRpcUrl)}
+                disabled={rpcPingState.status === 'testing'}
+                className="h-9 px-2.5 rounded-xl bg-slate-800/90 hover:bg-slate-700/90 text-slate-200 border border-slate-700 text-xs font-medium flex items-center space-x-1.5 cursor-pointer transition-all active:scale-95"
+                title="重新测试当前 RPC 响应与出块"
               >
-                <CircleDot className="w-3 h-3 text-amber-300" />
-                <span>沙盒模拟</span>
+                <RefreshCw className={`w-3.5 h-3.5 ${rpcPingState.status === 'testing' ? 'animate-spin text-indigo-400' : 'text-slate-400'}`} />
+                <span className="hidden sm:inline">测速 PING</span>
+              </button>
+
+              {/* Doctor */}
+              <button
+                id="btn-quick-doctor"
+                onClick={() => {
+                  setActiveSubTab('doctor');
+                  handleRunDoctor();
+                }}
+                className="h-9 px-3 rounded-xl bg-emerald-600/90 hover:bg-emerald-500 text-white text-xs font-bold flex items-center space-x-1.5 cursor-pointer shadow-xs transition-all active:scale-95"
+                title="一键诊断当前网络权限与合约环境"
+              >
+                <Zap className="w-3.5 h-3.5 text-emerald-200" />
+                <span>Doctor 体检</span>
               </button>
             </div>
 
@@ -872,7 +892,7 @@ export const InteractiveTester: React.FC = () => {
                 {browserWallet.chainId !== activeNetwork.chainId && (
                   <button
                     onClick={handleSwitchBrowserChain}
-                    className="px-2.5 py-1 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center space-x-1 cursor-pointer animate-pulse shadow-xs"
+                    className="h-9 px-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center space-x-1 cursor-pointer animate-pulse shadow-xs"
                     title={`钱包在 Chain ${browserWallet.chainId}，点击切换到 ${activeNetwork.name} (${activeNetwork.chainId})`}
                   >
                     <AlertTriangle className="w-3.5 h-3.5" />
@@ -881,7 +901,7 @@ export const InteractiveTester: React.FC = () => {
                 )}
                 <button
                   onClick={handleConnectBrowserWallet}
-                  className="px-2.5 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700/90 border border-emerald-500/40 text-xs font-mono text-emerald-400 flex items-center space-x-1.5 cursor-pointer"
+                  className="h-9 px-3 rounded-xl bg-slate-800/90 hover:bg-slate-700/90 border border-emerald-500/40 text-xs font-mono text-emerald-400 flex items-center space-x-1.5 cursor-pointer transition-all"
                   title={`已连: ${browserWallet.address} | 余额: ${browserWallet.balance.toFixed(4)} ${activeNetwork.currency}`}
                 >
                   <span className="w-2 h-2 rounded-full bg-emerald-400" />
@@ -892,885 +912,170 @@ export const InteractiveTester: React.FC = () => {
               <button
                 id="btn-connect-wallet"
                 onClick={handleConnectBrowserWallet}
-                className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center space-x-1.5 cursor-pointer shadow-xs transition-all"
+                className="h-9 px-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center space-x-1.5 cursor-pointer shadow-xs transition-all active:scale-95"
               >
                 <Wallet className="w-3.5 h-3.5" />
                 <span>连接 Web3 钱包</span>
               </button>
             )}
-
-            {/* Sync Balances */}
-            <button
-              id="btn-sync-balances"
-              onClick={syncAllBalances}
-              disabled={isSyncingBalances}
-              className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-medium flex items-center space-x-1.5 cursor-pointer transition-all"
-              title="从链上实时抓取 Sponsor 与所有子钱包余额"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isSyncingBalances ? 'animate-spin text-emerald-400' : ''}`} />
-              <span>{isSyncingBalances ? '同步中' : '同步余额'}</span>
-            </button>
-
-            {/* Ping */}
-            <button
-              id="btn-ping-rpc"
-              onClick={() => testRpcPing(effectiveRpcUrl)}
-              disabled={rpcPingState.status === 'testing'}
-              className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-medium flex items-center space-x-1.5 cursor-pointer transition-all"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${rpcPingState.status === 'testing' ? 'animate-spin' : ''}`} />
-              <span>测速 PING</span>
-            </button>
-
-            {/* Doctor */}
-            <button
-              id="btn-quick-doctor"
-              onClick={() => {
-                setActiveSubTab('doctor');
-                handleRunDoctor();
-              }}
-              className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center space-x-1.5 cursor-pointer shadow-xs transition-all"
-            >
-              <Zap className="w-3.5 h-3.5" />
-              <span>Doctor 体检</span>
-            </button>
           </div>
         </div>
+      </div>
 
-        {/* Dynamic Sub-tab Navigation */}
-        <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-800">
+      {/* 2. THREE-PANEL WORKSPACE CONTROLS & LAYOUT SWITCHER */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900/90 border border-slate-800 px-4 py-2.5 rounded-2xl shadow-xs">
+        <div className="flex items-center space-x-2 text-xs">
+          <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+          <span className="font-bold text-slate-200">三栏交互工作台</span>
+          <span className="text-slate-600">|</span>
+          <span className="text-slate-400 text-[11px] hidden sm:inline">
+            {panelLayout === 'workbench_center'
+              ? '左栏: 钱包与资金实操 · 中栏: 抢购与核心功能 · 右栏: 终端日志'
+              : '左栏: 钱包与资金实操 · 中栏: 终端日志 · 右栏: 抢购与核心功能'}
+          </span>
+        </div>
+
+        {/* Three-Panel Layout Switcher */}
+        <div className="bg-slate-950/90 p-1 rounded-xl border border-slate-800 flex items-center gap-1 shrink-0 text-xs shadow-xs self-start sm:self-auto">
+          <span className="text-[11px] text-slate-400 px-2 font-medium">三版排布:</span>
           <button
-            id="tab-mint"
-            onClick={() => setActiveSubTab('mint')}
-            className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-              activeSubTab === 'mint'
-                ? 'bg-emerald-500 text-slate-950 shadow-sm'
-                : 'bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white'
+            id="btn-layout-workbench-center"
+            onClick={() => setPanelLayout('workbench_center')}
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center space-x-1 ${
+              panelLayout === 'workbench_center'
+                ? 'bg-emerald-500 text-slate-950 font-bold shadow-xs'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-850'
             }`}
+            title="左: 钱包与充值 | 中: 抢购工作台 | 右: 终端日志"
           >
-            <Play className="w-3.5 h-3.5" />
-            <span>实时抢购发射舱 (T-2s Mint)</span>
+            <span>中:工作台 · 右:日志</span>
           </button>
-
           <button
-            id="tab-doctor"
-            onClick={() => setActiveSubTab('doctor')}
-            className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-              activeSubTab === 'doctor'
-                ? 'bg-emerald-500 text-slate-950 shadow-sm'
-                : 'bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white'
+            id="btn-layout-terminal-center"
+            onClick={() => setPanelLayout('terminal_center')}
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center space-x-1 ${
+              panelLayout === 'terminal_center'
+                ? 'bg-emerald-500 text-slate-950 font-bold shadow-xs'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-850'
             }`}
+            title="左: 钱包与充值 | 中: 终端日志 | 右: 抢购工作台"
           >
-            <Zap className="w-3.5 h-3.5" />
-            <span>环境与权限诊断 (Doctor)</span>
-          </button>
-
-          <button
-            id="tab-wallets"
-            onClick={() => setActiveSubTab('wallets')}
-            className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-              activeSubTab === 'wallets'
-                ? 'bg-emerald-500 text-slate-950 shadow-sm'
-                : 'bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white'
-            }`}
-          >
-            <Users className="w-3.5 h-3.5" />
-            <span>钱包与原子充值 (Wallets & Fund)</span>
-          </button>
-
-          <button
-            id="tab-executor"
-            onClick={() => setActiveSubTab('executor')}
-            className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-              activeSubTab === 'executor'
-                ? 'bg-emerald-500 text-slate-950 shadow-sm'
-                : 'bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white'
-            }`}
-          >
-            <Cpu className="w-3.5 h-3.5" />
-            <span>确定性执行器部署 (CREATE2)</span>
-          </button>
-
-          <button
-            id="tab-calldata"
-            onClick={() => setActiveSubTab('calldata')}
-            className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-              activeSubTab === 'calldata'
-                ? 'bg-emerald-500 text-slate-950 shadow-sm'
-                : 'bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white'
-            }`}
-          >
-            <FileCode className="w-3.5 h-3.5" />
-            <span>Calldata 只读嗅探器</span>
+            <span>中:日志 · 右:工作台</span>
           </button>
         </div>
       </div>
 
-      {/* 2. MAIN TWO-COLUMN SPLIT: LEFT LOGS STREAM (5 COLS), RIGHT WORKBENCH UI (7 COLS) */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Right Column on Desktop: Workbench & Sub-Wallets Matrix (7 cols) */}
-        <div className="lg:col-span-7 space-y-6 order-1 lg:order-2">
-          {/* TAB 1: MINT ENGINE */}
-          {activeSubTab === 'mint' && (
-            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-5">
-              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-                <div className="flex items-center space-x-2">
-                  <Play className="w-5 h-5 text-emerald-600" />
-                  <h3 className="font-bold text-slate-900 text-base">抢购发射舱工作台</h3>
-                </div>
-                <span className={`text-[11px] font-mono px-2.5 py-0.5 rounded-full border ${activeNetwork.badgeColor}`}>
-                  {activeNetwork.name} · {activeNetwork.currency}
-                </span>
-              </div>
-
-              {/* Mode Selection */}
-              <div className="space-y-2">
-                <label className="text-xs font-bold text-slate-700">运作架构模式:</label>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                  <button
-                    onClick={() => setMintMode('sponsored')}
-                    className={`p-3 rounded-xl border text-left cursor-pointer transition-all ${
-                      mintMode === 'sponsored'
-                        ? 'border-indigo-500 bg-indigo-50/50 ring-2 ring-indigo-200'
-                        : 'border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-bold text-indigo-950">EIP-7702 赞助</span>
-                      <span className="text-[10px] bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded font-mono">
-                        代付推荐
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-500 mt-1 leading-snug">主代付钱包出 Gas，NFT 原子归集</p>
-                  </button>
-
-                  <button
-                    onClick={() => setMintMode('self_funded')}
-                    className={`p-3 rounded-xl border text-left cursor-pointer transition-all ${
-                      mintMode === 'self_funded'
-                        ? 'border-emerald-500 bg-emerald-50/50 ring-2 ring-emerald-200'
-                        : 'border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-bold text-emerald-950">自费多钱包并发</span>
-                      <span className="text-[10px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded font-mono">
-                        传统并发
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-500 mt-1 leading-snug">各钱包自备代币，并发广播</p>
-                  </button>
-
-                  <button
-                    onClick={() => setMintMode('single')}
-                    className={`p-3 rounded-xl border text-left cursor-pointer transition-all ${
-                      mintMode === 'single'
-                        ? 'border-slate-500 bg-slate-100 ring-2 ring-slate-200'
-                        : 'border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-bold text-slate-900">单钱包极简</span>
-                      <span className="text-[10px] bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded font-mono">
-                        1 钱包
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-500 mt-1 leading-snug">零外部清单依赖，直接发起</p>
-                  </button>
-                </div>
-              </div>
-
-              {/* Target Project Card */}
-              <div className="bg-slate-50 rounded-xl p-4 border border-slate-200 space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-700">SeaDrop 目标项目与阶段参数</span>
-                  <span className="text-xs font-mono bg-white px-2 py-0.5 rounded border border-slate-200 text-emerald-700">
-                    OpenSea SeaDrop
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                  <div>
-                    <span className="text-slate-400 block text-[11px]">项目名称</span>
-                    <input
-                      type="text"
-                      value={selectedDrop.name}
-                      onChange={(e) => setSelectedDrop({ ...selectedDrop, name: e.target.value })}
-                      className="w-full mt-1 px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-900 font-medium"
-                    />
-                  </div>
-                  <div>
-                    <span className="text-slate-400 block text-[11px]">活动阶段</span>
-                    <select
-                      value={selectedDrop.activeStage}
-                      onChange={(e) => setSelectedDrop({ ...selectedDrop, activeStage: e.target.value })}
-                      className="w-full mt-1 px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-900 font-medium cursor-pointer"
-                    >
-                      <option value="WL & Allowlist">阶段 1: WL & Allowlist 白名单</option>
-                      <option value="FCFS Priority">阶段 2: FCFS 优先抢购</option>
-                      <option value="Public Sale">阶段 3: Public 公开发售</option>
-                    </select>
-                  </div>
-                  <div>
-                    <span className="text-slate-400 block text-[11px]">铸造单价 ({activeNetwork.currency})</span>
-                    <input
-                      type="number"
-                      step="0.001"
-                      value={selectedDrop.mintPrice}
-                      onChange={(e) => setSelectedDrop({ ...selectedDrop, mintPrice: parseFloat(e.target.value) || 0 })}
-                      className="w-full mt-1 px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-900 font-mono"
-                    />
-                  </div>
-                  <div>
-                    <span className="text-slate-400 block text-[11px]">SeaDrop 合约地址</span>
-                    <input
-                      type="text"
-                      value={selectedDrop.contractAddress}
-                      onChange={(e) => setSelectedDrop({ ...selectedDrop, contractAddress: e.target.value })}
-                      className="w-full mt-1 px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-900 font-mono text-[11px]"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* Simulation Safeguards & Options */}
-              <div className="flex items-center justify-between p-3 rounded-xl bg-amber-50/70 border border-amber-200 text-xs text-amber-900">
-                <div className="flex items-center space-x-2">
-                  <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0" />
-                  <div>
-                    <span className="font-bold">单点失败隔离容错机制测试</span>
-                    <p className="text-[11px] text-amber-700">模拟钱包 #2 遭遇限购 Revert，验证其余钱包正常打包不中断</p>
-                  </div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={simulatePartialRevert}
-                  onChange={(e) => setSimulatePartialRevert(e.target.checked)}
-                  className="w-4 h-4 text-emerald-600 rounded cursor-pointer"
-                />
-              </div>
-
-              {/* Trigger Buttons */}
-              <div className="pt-2 flex flex-col sm:flex-row items-center gap-3">
-                <button
-                  id="btn-run-fast-mint"
-                  disabled={isMintRunning}
-                  onClick={() => startMintSimulation(true)}
-                  className="w-full sm:flex-1 py-3 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-sm rounded-xl transition-all shadow-sm flex items-center justify-center space-x-2 cursor-pointer"
-                >
-                  <Flame className="w-4 h-4" />
-                  <span>{isMintRunning ? '抢购执行中...' : '启动抢购模拟测试 (T-2s 调度)'}</span>
-                </button>
-
-                <button
-                  id="btn-run-timed-mint"
-                  disabled={isMintRunning}
-                  onClick={() => startMintSimulation(false)}
-                  className="w-full sm:w-auto py-3 px-4 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-800 font-semibold text-xs rounded-xl transition-all border border-slate-200 flex items-center justify-center space-x-1.5 cursor-pointer"
-                >
-                  <Clock className="w-3.5 h-3.5 text-slate-500" />
-                  <span>15 秒倒计时演练</span>
-                </button>
-              </div>
-
-              {/* Live Progress */}
-              {isMintRunning && (
-                <div className="space-y-2 p-3.5 bg-slate-900 text-white rounded-xl border border-slate-800">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-mono text-emerald-400 font-medium">
-                      {countdownSeconds !== null && countdownSeconds > 0
-                        ? `⏱️ 倒计时剩余 T-${countdownSeconds}s... 正在等待阶段开放`
-                        : '🚀 正在上链广播与确认...'}
-                    </span>
-                    <span className="font-mono text-slate-400">{mintProgress}%</span>
-                  </div>
-                  <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
-                    <div
-                      className="bg-emerald-500 h-full transition-all duration-300 rounded-full"
-                      style={{ width: `${mintProgress}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* TAB 2: DOCTOR DIAGNOSTIC */}
-          {activeSubTab === 'doctor' && (
-            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-5">
-              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-                <div className="flex items-center space-x-2">
-                  <Zap className="w-5 h-5 text-emerald-600" />
-                  <h3 className="font-bold text-slate-900 text-base">环境与权限诊断 (Doctor)</h3>
-                </div>
-                <button
-                  onClick={handleRunDoctor}
-                  disabled={doctorRunning}
-                  className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition-all flex items-center space-x-1.5 cursor-pointer shadow-xs"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${doctorRunning ? 'animate-spin' : ''}`} />
-                  <span>{doctorRunning ? '诊断中...' : '运行 Doctor 诊断'}</span>
-                </button>
-              </div>
-
-              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs text-slate-600 leading-relaxed">
-                正在诊断网络: <span className="font-bold text-slate-900">{activeNetwork.name}</span> | 节点地址: <span className="font-mono text-slate-800">{effectiveRpcUrl}</span>
-              </div>
-
-              {/* Diagnostics Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                <div className="p-3 rounded-xl border border-slate-200 bg-slate-50 flex items-start space-x-2.5">
-                  {doctorResults ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  ) : (
-                    <div className="w-4 h-4 rounded-full border border-slate-300 shrink-0 mt-0.5" />
-                  )}
-                  <div>
-                    <span className="font-bold text-slate-900">RPC 节点延迟与连通性</span>
-                    <p className="text-[11px] text-slate-500 mt-0.5">测试与 RPC 节点的通信往返耗时（当前: {rpcPingState.latencyMs}ms）</p>
-                  </div>
-                </div>
-
-                <div className="p-3 rounded-xl border border-slate-200 bg-slate-50 flex items-start space-x-2.5">
-                  {doctorResults ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  ) : (
-                    <div className="w-4 h-4 rounded-full border border-slate-300 shrink-0 mt-0.5" />
-                  )}
-                  <div>
-                    <span className="font-bold text-slate-900">EIP-1559 费率历史 (eth_feeHistory)</span>
-                    <p className="text-[11px] text-slate-500 mt-0.5">确保能动态拉取最近区块的 BaseFee 与小费</p>
-                  </div>
-                </div>
-
-                <div className="p-3 rounded-xl border border-slate-200 bg-slate-50 flex items-start space-x-2.5">
-                  {doctorResults ? (
-                    doctorResults.eip7702Supported ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                    ) : (
-                      <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
-                    )
-                  ) : (
-                    <div className="w-4 h-4 rounded-full border border-slate-300 shrink-0 mt-0.5" />
-                  )}
-                  <div>
-                    <span className="font-bold text-slate-900">EIP-7702 Prague 授权支持</span>
-                    <p className="text-[11px] text-slate-500 mt-0.5">
-                      {activeNetwork.supports7702 ? '支持类型 0x04 委托交易' : '当前链未激活，建议切换至 Base 或自费模式'}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="p-3 rounded-xl border border-slate-200 bg-slate-50 flex items-start space-x-2.5">
-                  {doctorResults ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  ) : (
-                    <div className="w-4 h-4 rounded-full border border-slate-300 shrink-0 mt-0.5" />
-                  )}
-                  <div>
-                    <span className="font-bold text-slate-900">EIP-1153 暂态存储防重入</span>
-                    <p className="text-[11px] text-slate-500 mt-0.5">测试 TSTORE / TLOAD 指令，仅需 100 gas</p>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* TAB 3: WALLETS & FUNDING */}
-          {activeSubTab === 'wallets' && (
-            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-5">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-100 gap-2">
-                <div className="flex items-center space-x-2">
-                  <Users className="w-5 h-5 text-emerald-600" />
-                  <h3 className="font-bold text-slate-900 text-base">钱包与主网资金实操</h3>
-                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold ${
-                    executionMode === 'real'
-                      ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                      : 'bg-amber-100 text-amber-800 border border-amber-300'
-                  }`}>
-                    {executionMode === 'real' ? '● 主网真实链上' : '○ 沙盒无损仿真'}
-                  </span>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <button
-                    onClick={syncAllBalances}
-                    disabled={isSyncingBalances}
-                    className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-medium transition-all flex items-center space-x-1 cursor-pointer"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isSyncingBalances ? 'animate-spin text-emerald-600' : ''}`} />
-                    <span>同步链上余额</span>
-                  </button>
-                  <button
-                    onClick={copyWalletsJson}
-                    className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-mono transition-all flex items-center space-x-1 cursor-pointer"
-                  >
-                    {copiedWallets ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                    <span>{copiedWallets ? '已复制 JSON' : '复制 wallets.json'}</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Sponsor & Recipient Configuration */}
-              <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/80 space-y-3.5 text-xs">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <span className="font-bold text-slate-900 flex items-center space-x-1.5">
-                    <Wallet className="w-4 h-4 text-emerald-600" />
-                    <span>主代付钱包 (Sponsor) 与归集设置</span>
-                  </span>
-                  
-                  {/* Signing Method Selector */}
-                  <div className="flex items-center space-x-3 text-slate-700">
-                    <label className="flex items-center space-x-1.5 cursor-pointer">
-                      <input
-                        type="radio"
-                        name="sponsorSignMethod"
-                        checked={useBrowserWallet}
-                        onChange={() => setUseBrowserWallet(true)}
-                        className="text-emerald-600"
-                      />
-                      <span className="font-medium">Web3 浏览器钱包签名 (推荐)</span>
-                    </label>
-                    <label className="flex items-center space-x-1.5 cursor-pointer">
-                      <input
-                        type="radio"
-                        name="sponsorSignMethod"
-                        checked={!useBrowserWallet}
-                        onChange={() => setUseBrowserWallet(false)}
-                        className="text-emerald-600"
-                      />
-                      <span className="font-medium">Sponsor 私钥离线签名</span>
-                    </label>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {/* Sponsor Address or Browser Wallet */}
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-600 font-medium">代付 Sponsor 地址:</span>
-                      <span className="text-emerald-700 font-bold font-mono">
-                        链上余额: {sponsorBalance.toFixed(4)} {activeNetwork.currency}
-                      </span>
-                    </div>
-                    {useBrowserWallet ? (
-                      browserWallet.isConnected ? (
-                        <div className="p-2 bg-white border border-emerald-300 rounded-lg flex items-center justify-between font-mono text-xs">
-                          <span className="text-slate-800">{browserWallet.address}</span>
-                          <span className="text-[10px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded font-bold">已绑定</span>
-                        </div>
-                      ) : (
-                        <div className="p-2 bg-amber-50 border border-amber-200 rounded-lg flex items-center justify-between">
-                          <span className="text-amber-800 text-[11px]">尚未连接 Web3 钱包</span>
-                          <button
-                            onClick={handleConnectBrowserWallet}
-                            className="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-medium cursor-pointer"
-                          >
-                            立即连接
-                          </button>
-                        </div>
-                      )
-                    ) : (
-                      <input
-                        type="text"
-                        value={sponsorAddress}
-                        onChange={(e) => setSponsorAddress(e.target.value)}
-                        placeholder="0x..."
-                        className="w-full px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg font-mono text-xs text-slate-900"
-                      />
-                    )}
-                  </div>
-
-                  {/* Recipient Address */}
-                  <div className="space-y-1">
-                    <span className="text-slate-600 font-medium block">归集接收主地址 (Recipient):</span>
-                    <input
-                      type="text"
-                      value={recipientAddress}
-                      onChange={(e) => setRecipientAddress(e.target.value)}
-                      placeholder="0x..."
-                      className="w-full px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg font-mono text-xs text-slate-900"
-                    />
-                  </div>
-                </div>
-
-                {/* Direct Sponsor Private Key Input (if chosen) */}
-                {!useBrowserWallet && (
-                  <div className="pt-2 border-t border-slate-200 space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-600 font-medium flex items-center space-x-1">
-                        <Key className="w-3.5 h-3.5 text-amber-600" />
-                        <span>Sponsor 代付私钥 (用于 RPC 节点内存离线签名):</span>
-                      </span>
-                      <button
-                        onClick={() => setShowSponsorKey(!showSponsorKey)}
-                        className="text-slate-500 hover:text-slate-800 flex items-center space-x-1 text-[11px] cursor-pointer"
-                      >
-                        {showSponsorKey ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-                        <span>{showSponsorKey ? '隐藏' : '显示'}</span>
-                      </button>
-                    </div>
-                    <input
-                      type={showSponsorKey ? 'text' : 'password'}
-                      value={sponsorPrivateKey}
-                      onChange={(e) => setSponsorPrivateKey(e.target.value)}
-                      placeholder="0x1234567890abcdef..."
-                      className="w-full px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg font-mono text-xs text-slate-900"
-                    />
-                    <p className="text-[10px] text-slate-500">
-                      私钥严格保留在当前前端本地内存中，仅用于向 {activeNetwork.name} RPC 节点签名 Multicall3 充值交易，绝不上报。
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              {/* Actions */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800">批量加密生成</span>
-                    <span className="text-[10px] text-slate-500">Secp256k1 EOA</span>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <input
-                      type="number"
-                      min="1"
-                      max="25"
-                      value={genCount}
-                      onChange={(e) => setGenCount(parseInt(e.target.value) || 1)}
-                      className="w-16 px-2 py-1 bg-white border border-slate-200 rounded text-xs text-center font-mono"
-                    />
-                    <button
-                      onClick={handleGenerateWallets}
-                      className="flex-1 py-1 px-2 bg-slate-900 hover:bg-slate-800 text-white rounded text-xs font-medium cursor-pointer"
-                    >
-                      生成有效密钥对
-                    </button>
-                  </div>
-                  <p className="text-[10px] text-slate-500">生成标准 0x 私钥与匹配以太坊地址</p>
-                </div>
-
-                <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800">Multicall3 批量充值</span>
-                    <span className="text-[10px] text-emerald-600 font-mono">--fund</span>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <input
-                      type="number"
-                      step="0.005"
-                      value={fundAmountPerWallet}
-                      onChange={(e) => setFundAmountPerWallet(parseFloat(e.target.value) || 0)}
-                      className="w-20 px-2 py-1 bg-white border border-slate-200 rounded text-xs text-center font-mono"
-                    />
-                    <button
-                      disabled={isFunding}
-                      onClick={handleMulticallFund}
-                      className="flex-1 py-1 px-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded text-xs font-medium cursor-pointer shadow-xs"
-                    >
-                      {isFunding ? '上链分发中...' : 'Multicall3 充值'}
-                    </button>
-                  </div>
-                  <p className="text-[10px] text-slate-500">
-                    单笔原子交易向 {wallets.length} 个子钱包各分发 {fundAmountPerWallet} {activeNetwork.currency}
-                  </p>
-                </div>
-
-                <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800">资金一键原子归集</span>
-                    <span className="text-[10px] text-rose-600 font-mono">--withdraw</span>
-                  </div>
-                  <button
-                    disabled={isWithdrawing}
-                    onClick={handleWithdrawFunds}
-                    className="w-full py-1.5 px-2 bg-slate-200 hover:bg-slate-300 disabled:opacity-50 text-slate-800 rounded text-xs font-medium cursor-pointer"
-                  >
-                    {isWithdrawing ? '归集中...' : '回收子钱包资金至 Recipient'}
-                  </button>
-                  <p className="text-[10px] text-slate-500">
-                    核算 21,000 gas 并扣减后，将剩余代币全部安全转回主接收钱包
-                  </p>
-                </div>
-              </div>
-
-              {/* Undelegate Row */}
-              <div className="p-3.5 rounded-xl border border-indigo-100 bg-indigo-50/50 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
-                <div>
-                  <span className="font-bold text-indigo-950">EIP-7702 委托代码复原 (--undelegate)</span>
-                  <p className="text-[11px] text-indigo-800/80">抢购完成后将子钱包的代码指针重置为 address(0)，复原为纯 EOA 账户</p>
-                </div>
-                <button
-                  onClick={handleUndelegate}
-                  className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-medium cursor-pointer shrink-0"
-                >
-                  撤回所有委托
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* TAB 4: DEPLOY EXECUTOR */}
-          {activeSubTab === 'executor' && (
-            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-5">
-              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-                <div className="flex items-center space-x-2">
-                  <Cpu className="w-5 h-5 text-emerald-600" />
-                  <h3 className="font-bold text-slate-900 text-base">确定性执行器部署计算器</h3>
-                </div>
-                <button
-                  onClick={handleDeployExecutor}
-                  className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition-all flex items-center space-x-1.5 cursor-pointer shadow-xs"
-                >
-                  <Cpu className="w-3.5 h-3.5" />
-                  <span>执行部署模拟</span>
-                </button>
-              </div>
-
-              <div className="space-y-3 text-xs">
-                <div>
-                  <span className="text-slate-500 block text-[11px]">CREATE2 确定性工厂</span>
-                  <input
-                    type="text"
-                    disabled
-                    value="0x4e59b44847b379578588920cA78FbF26c0B4956C"
-                    className="w-full mt-1 px-2.5 py-1.5 bg-slate-100 border border-slate-200 rounded-lg text-slate-600 font-mono text-xs"
-                  />
-                </div>
-
-                <div>
-                  <span className="text-slate-500 block text-[11px]">Sponsor 代付钱包地址 (计算唯一 Salt)</span>
-                  <input
-                    type="text"
-                    value={sponsorAddress}
-                    onChange={(e) => setSponsorAddress(e.target.value)}
-                    className="w-full mt-1 px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-900 font-mono text-xs"
-                  />
-                </div>
-
-                <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-slate-800">计算得出的 SponsoredMintExecutor 地址:</span>
-                    <span className="text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200 font-mono text-[10px]">
-                      {executorDeployed ? '已部署 (Active)' : '待部署'}
-                    </span>
-                  </div>
-                  <div className="bg-slate-950 text-emerald-400 p-2.5 rounded font-mono text-xs break-all border border-slate-800">
-                    {calcExecutorAddress}
-                  </div>
-                  <p className="text-[11px] text-slate-500 leading-relaxed">
-                    公式: <code className="text-slate-800 font-mono">CREATE2(0x4e59..., salt, initCodeHash)</code>
-                    。在任何 EVM 链上，只要 SponsorKey 一致，计算出的执行器地址永远一致！
-                  </p>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* TAB 5: CALLDATA PROBE */}
-          {activeSubTab === 'calldata' && (
-            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-5">
-              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-                <div className="flex items-center space-x-2">
-                  <FileCode className="w-5 h-5 text-emerald-600" />
-                  <h3 className="font-bold text-slate-900 text-base">Calldata 只读测试探测器</h3>
-                </div>
-                <button
-                  onClick={() => {
-                    addLog('cmd', `$ opensea-mint calldata --collection ${selectedDrop.collectionSlug}`);
-                    addLog('info', `向 OpenSea GraphQL 发起探测: collection="${selectedDrop.collectionSlug}"`);
-                    setTimeout(() => {
-                      addLog('success', `[OK] 抓取到 1 个活跃阶段: ${selectedDrop.activeStage}`);
-                      addLog('info', 'Calldata: 0x8a90d402000000000000000000000000... [长度: 388 字节, Merkle Proof: 包含 4 个叶节点哈希]');
-                    }, 700);
-                  }}
-                  className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold transition-all flex items-center space-x-1.5 cursor-pointer shadow-xs"
-                >
-                  <Send className="w-3.5 h-3.5" />
-                  <span>探测 Calldata</span>
-                </button>
-              </div>
-
-              <div className="space-y-3 text-xs">
-                <p className="text-slate-600 leading-relaxed">
-                  在正式开盘前，检查 OpenSea 阶段配置是否已经生效，并验证特定子钱包的 Merkle 证明是否被 SeaDrop 正确识别。
-                </p>
-
-                <div className="bg-slate-950 text-slate-200 p-3.5 rounded-xl font-mono text-[11px] space-y-2 border border-slate-800 overflow-x-auto">
-                  <div className="text-emerald-400 font-bold"># OpenSea GraphQL 模拟响应 Payload</div>
-                  <div>{"{"}</div>
-                  <div className="pl-4 text-slate-400">"feeRecipient": "0x0000a26b00c1F0DF003000390027140000fAa719",</div>
-                  <div className="pl-4 text-slate-400">"minter": "{wallets[0]?.address || '0x...'}",</div>
-                  <div className="pl-4 text-slate-400">"quantity": 1,</div>
-                  <div className="pl-4 text-slate-400">"mintPrice": "5000000000000000",</div>
-                  <div className="pl-4 text-slate-400">"merkleProof": [</div>
-                  <div className="pl-8 text-amber-400">"0x9f1a28...e31b",</div>
-                  <div className="pl-8 text-amber-400">"0x4b7c19...90ca"</div>
-                  <div className="pl-4 text-slate-400">]</div>
-                  <div>{"}"}</div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Sub-wallet List Matrix */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2">
-                <Users className="w-4 h-4 text-slate-700" />
-                <h4 className="font-bold text-slate-900 text-sm">测试子钱包列表 ({wallets.length} 个)</h4>
-              </div>
-              <span className="text-[11px] text-slate-500 font-mono">
-                总代币: {wallets.reduce((acc, w) => acc + w.nativeBalance, 0).toFixed(4)} {activeNetwork.currency}
-              </span>
-            </div>
-
-            <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
-              {wallets.map((w) => (
-                <div
-                  key={w.id}
-                  className="flex items-center justify-between p-3 rounded-xl border border-slate-100 bg-slate-50/70 hover:bg-slate-100/80 transition-all text-xs"
-                >
-                  <div className="flex items-center space-x-3">
-                    <span className="w-5 h-5 rounded-full bg-slate-900 text-white font-mono text-[10px] font-bold flex items-center justify-center">
-                      {w.id}
-                    </span>
-                    <div>
-                      <div className="flex items-center space-x-1.5">
-                        <span className="font-mono font-bold text-slate-800">
-                          {w.address.slice(0, 8)}...{w.address.slice(-6)}
-                        </span>
-                        {w.isDelegated ? (
-                          <span className="text-[9px] bg-indigo-100 text-indigo-700 px-1.5 py-0.2 rounded font-mono">
-                            7702 已委托
-                          </span>
-                        ) : (
-                          <span className="text-[9px] bg-slate-200 text-slate-600 px-1.5 py-0.2 rounded font-mono">
-                            纯 EOA
-                          </span>
-                        )}
-                      </div>
-                      <span className="text-[11px] text-slate-500 font-mono">
-                        余额: {w.nativeBalance} {activeNetwork.currency}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center space-x-2">
-                    {w.status === 'idle' && (
-                      <span className="px-2 py-0.5 rounded-full bg-slate-200 text-slate-700 text-[10px] font-mono">
-                        空闲待命
-                      </span>
-                    )}
-                    {w.status === 'ready' && (
-                      <span className="px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 text-[10px] font-mono animate-pulse">
-                        签名锁定
-                      </span>
-                    )}
-                    {w.status === 'fetching_calldata' && (
-                      <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-mono animate-pulse">
-                        Calldata 抓取
-                      </span>
-                    )}
-                    {w.status === 'broadcasting' && (
-                      <span className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800 text-[10px] font-mono animate-pulse">
-                        上链广播中
-                      </span>
-                    )}
-                    {w.status === 'success' && (
-                      <div className="flex items-center space-x-1 text-emerald-600 font-mono text-[11px]">
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>已铸造 {w.mintedNftCount} 枚</span>
-                      </div>
-                    )}
-                    {w.status === 'reverted' && (
-                      <div className="flex items-center space-x-1 text-rose-600 font-mono text-[11px]">
-                        <XCircle className="w-3.5 h-3.5" />
-                        <span>单点回滚 (已隔离)</span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
+      {/* 3. MAIN THREE-PANEL SPLIT:
+          - Panel 1 (Left): 钱包与原子充值 (Wallets & Atomic Funding + Matrix + Asset Visualizer)
+          - Panel 2 (Center) & Panel 3 (Right): 抢购工作台 vs 终端实时日志 (Toggleable via panelLayout) */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 items-start">
+        {/* Panel 1 (Left): 钱包与原子充值 (4 cols on xl) */}
+        <div id="panel-wallets" className="xl:col-span-4 space-y-5 order-1">
+          <WalletsFundPanel
+            wallets={wallets}
+            activeNetwork={activeNetwork}
+            sponsorAddress={sponsorAddress}
+            setSponsorAddress={setSponsorAddress}
+            recipientAddress={recipientAddress}
+            setRecipientAddress={setRecipientAddress}
+            sponsorBalance={sponsorBalance}
+            recipientNftCount={recipientNftCount}
+            useBrowserWallet={useBrowserWallet}
+            setUseBrowserWallet={setUseBrowserWallet}
+            browserWallet={browserWallet}
+            handleConnectBrowserWallet={handleConnectBrowserWallet}
+            sponsorPrivateKey={sponsorPrivateKey}
+            setSponsorPrivateKey={setSponsorPrivateKey}
+            showSponsorKey={showSponsorKey}
+            setShowSponsorKey={setShowSponsorKey}
+            genCount={genCount}
+            setGenCount={setGenCount}
+            handleGenerateWallets={handleGenerateWallets}
+            fundAmountPerWallet={fundAmountPerWallet}
+            setFundAmountPerWallet={setFundAmountPerWallet}
+            isFunding={isFunding}
+            handleMulticallFund={handleMulticallFund}
+            isWithdrawing={isWithdrawing}
+            handleWithdrawFunds={handleWithdrawFunds}
+            handleUndelegate={handleUndelegate}
+            syncAllBalances={syncAllBalances}
+            isSyncingBalances={isSyncingBalances}
+            copyWalletsJson={copyWalletsJson}
+            copiedWallets={copiedWallets}
+            isHighlighted={activeSubTab === 'wallets'}
+          />
         </div>
 
-        {/* Left Column on Desktop: Terminal & Chain Asset Visualizer (5 cols) */}
-        <div className="lg:col-span-5 space-y-6 order-2 lg:order-1">
-          {/* CLI Terminal Simulator */}
-          <div className="bg-slate-950 rounded-2xl border border-slate-800 p-4 shadow-sm flex flex-col h-[560px]">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800 text-xs">
-              <div className="flex items-center space-x-2">
-                <div className="flex space-x-1.5">
-                  <div className="w-2.5 h-2.5 rounded-full bg-rose-500/80" />
-                  <div className="w-2.5 h-2.5 rounded-full bg-amber-500/80" />
-                  <div className="w-2.5 h-2.5 rounded-full bg-emerald-500/80" />
-                </div>
-                <span className="text-slate-400 font-mono ml-2">osnm-terminal-stream</span>
-              </div>
-              <button
-                onClick={() => setLogs([])}
-                className="text-[11px] text-slate-500 hover:text-slate-300 font-mono cursor-pointer"
-              >
-                清空日志
-              </button>
-            </div>
+        {/* Panel 2 (Center): 4 cols on xl */}
+        <div id="panel-center" className="xl:col-span-4 space-y-5 order-2">
+          {panelLayout === 'workbench_center' ? (
+            <WorkbenchPanel
+              activeSubTab={activeSubTab}
+              setActiveSubTab={setActiveSubTab}
+              activeNetwork={activeNetwork}
+              effectiveRpcUrl={effectiveRpcUrl}
+              mintMode={mintMode}
+              setMintMode={setMintMode}
+              selectedDrop={selectedDrop}
+              setSelectedDrop={setSelectedDrop}
+              isMintRunning={isMintRunning}
+              startRealMintExecution={startRealMintExecution}
+              countdownSeconds={countdownSeconds}
+              mintProgress={mintProgress}
+              doctorResults={doctorResults}
+              doctorRunning={doctorRunning}
+              handleRunDoctor={handleRunDoctor}
+              calcExecutorAddress={calcExecutorAddress}
+              executorDeployed={executorDeployed}
+              handleDeployExecutor={handleDeployExecutor}
+              sponsorAddress={sponsorAddress}
+              setSponsorAddress={setSponsorAddress}
+              addLog={addLog}
+              wallets={wallets}
+            />
+          ) : (
+            <TerminalPanel
+              logs={logs}
+              onClearLogs={() => setLogs([])}
+              terminalEndRef={terminalEndRef}
+            />
+          )}
+        </div>
 
-            {/* Scrollable Logs Output */}
-            <div className="flex-1 overflow-y-auto py-3 space-y-2 font-mono text-xs leading-relaxed">
-              {logs.map((log, idx) => (
-                <div key={idx} className="flex items-start space-x-2">
-                  <span className="text-slate-600 shrink-0 text-[10px] mt-0.5">{log.timestamp}</span>
-                  {log.level === 'cmd' && <span className="text-emerald-400 font-bold">{log.message}</span>}
-                  {log.level === 'info' && <span className="text-slate-300">{log.message}</span>}
-                  {log.level === 'success' && <span className="text-emerald-400">{log.message}</span>}
-                  {log.level === 'warn' && <span className="text-amber-400">{log.message}</span>}
-                  {log.level === 'error' && <span className="text-rose-400 font-bold">{log.message}</span>}
-                </div>
-              ))}
-              <div ref={terminalEndRef} />
-            </div>
-
-            {/* Terminal Input Mock */}
-            <div className="pt-2 border-t border-slate-800 flex items-center space-x-2 text-xs font-mono text-slate-400">
-              <span className="text-emerald-400 font-bold">&gt;</span>
-              <span className="text-slate-500 text-[11px]">准备就绪，点击右侧工作台功能按键触发真实调度</span>
-            </div>
-          </div>
-
-          {/* Chain Asset Visualizer */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-3">
-            <div className="flex items-center space-x-2 text-xs font-bold text-slate-800">
-              <Layers className="w-4 h-4 text-emerald-600" />
-              <span>当前网络链上资金与 NFT 原子流向</span>
-            </div>
-
-            <div className="space-y-2.5 text-xs">
-              <div className="flex items-center justify-between p-2.5 rounded-lg bg-slate-50 border border-slate-100">
-                <span className="text-slate-500">代付赞助钱包 (Sponsor)</span>
-                <span className="font-mono font-bold text-slate-900">
-                  {sponsorBalance.toFixed(4)} {activeNetwork.currency}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between p-2.5 rounded-lg bg-slate-50 border border-slate-100">
-                <span className="text-slate-500">所有子钱包汇总资金</span>
-                <span className="font-mono font-bold text-slate-900">
-                  {wallets.reduce((sum, w) => sum + w.nativeBalance, 0).toFixed(4)} {activeNetwork.currency}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between p-2.5 rounded-lg bg-indigo-50 border border-indigo-100">
-                <div>
-                  <span className="text-indigo-900 font-bold block">最终 NFT 归集主地址</span>
-                  <span className="text-[10px] font-mono text-indigo-700">{recipientAddress.slice(0, 16)}...</span>
-                </div>
-                <div className="text-right">
-                  <span className="text-lg font-bold font-mono text-indigo-600">{recipientNftCount}</span>
-                  <span className="text-[11px] text-indigo-800 block">枚已安全接收</span>
-                </div>
-              </div>
-            </div>
-          </div>
+        {/* Panel 3 (Right): 4 cols on xl */}
+        <div id="panel-right" className="xl:col-span-4 space-y-5 order-3">
+          {panelLayout === 'workbench_center' ? (
+            <TerminalPanel
+              logs={logs}
+              onClearLogs={() => setLogs([])}
+              terminalEndRef={terminalEndRef}
+            />
+          ) : (
+            <WorkbenchPanel
+              activeSubTab={activeSubTab}
+              setActiveSubTab={setActiveSubTab}
+              activeNetwork={activeNetwork}
+              effectiveRpcUrl={effectiveRpcUrl}
+              mintMode={mintMode}
+              setMintMode={setMintMode}
+              selectedDrop={selectedDrop}
+              setSelectedDrop={setSelectedDrop}
+              isMintRunning={isMintRunning}
+              startRealMintExecution={startRealMintExecution}
+              countdownSeconds={countdownSeconds}
+              mintProgress={mintProgress}
+              doctorResults={doctorResults}
+              doctorRunning={doctorRunning}
+              handleRunDoctor={handleRunDoctor}
+              calcExecutorAddress={calcExecutorAddress}
+              executorDeployed={executorDeployed}
+              handleDeployExecutor={handleDeployExecutor}
+              sponsorAddress={sponsorAddress}
+              setSponsorAddress={setSponsorAddress}
+              addLog={addLog}
+              wallets={wallets}
+            />
+          )}
         </div>
       </div>
 
@@ -1846,35 +1151,73 @@ export const InteractiveTester: React.FC = () => {
                   <div className="relative">
                     <input
                       type={showApiKey ? 'text' : 'password'}
-                      placeholder={`https://${activeNetwork.id}-mainnet.g.alchemy.com/v2/YOUR-KEY`}
+                      placeholder={activeNetwork.id === 'arc' ? 'https://arc-mainnet.infura.io/v3/YOUR-API-KEY 或 https://rpc.mainnet.arc.io' : `https://${activeNetwork.id}-mainnet.g.alchemy.com/v2/YOUR-KEY`}
                       value={customRpcUrl}
                       onChange={(e) => setCustomRpcUrl(e.target.value)}
                       className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-slate-900 font-mono text-xs focus:ring-2 focus:ring-emerald-500 focus:outline-none"
                     />
                   </div>
 
+                  {/* Infura Note for Arc */}
+                  {activeNetwork.id === 'arc' && (
+                    <div className="p-2 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-800 leading-snug">
+                      ⚠️ <strong>Infura 节点格式说明</strong>: Infura 必须携带 <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">/v3/YOUR_KEY</code> 路径，裸写域名 <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">https://arc-mainnet.infura.io/</code> 会被拒绝访问 (404)。无 Key 时建议直接使用官方免 Key 节点 <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">https://rpc.mainnet.arc.io</code>。
+                    </div>
+                  )}
+
                   {/* Preset Buttons */}
                   <div className="space-y-1.5 pt-1">
                     <span className="text-[11px] text-slate-500">主流服务商快捷填入模板:</span>
                     <div className="flex flex-wrap gap-1.5">
-                      <button
-                        onClick={() => setCustomRpcUrl(`https://${activeNetwork.id}-mainnet.g.alchemy.com/v2/demo-key`)}
-                        className="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-[10px] font-mono cursor-pointer"
-                      >
-                        Alchemy
-                      </button>
-                      <button
-                        onClick={() => setCustomRpcUrl(`https://${activeNetwork.id}.infura.io/v3/demo-key`)}
-                        className="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-[10px] font-mono cursor-pointer"
-                      >
-                        Infura
-                      </button>
-                      <button
-                        onClick={() => setCustomRpcUrl(`https://${activeNetwork.id}.quiknode.pro/demo-key/`)}
-                        className="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-[10px] font-mono cursor-pointer"
-                      >
-                        QuickNode
-                      </button>
+                      {activeNetwork.id === 'arc' ? (
+                        <>
+                          <button
+                            onClick={() => setCustomRpcUrl('https://rpc.arc-scan.org')}
+                            className="px-2 py-1 bg-sky-50 text-sky-700 hover:bg-sky-100 border border-sky-200 rounded text-[10px] font-mono font-bold cursor-pointer"
+                          >
+                            arc-scan 节点 (rpc.arc-scan.org)
+                          </button>
+                          <button
+                            onClick={() => setCustomRpcUrl('https://rpc.mainnet.arc.io')}
+                            className="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-[10px] font-mono font-bold cursor-pointer"
+                          >
+                            官方公共节点 (rpc.mainnet.arc.io)
+                          </button>
+                          <button
+                            onClick={() => setCustomRpcUrl('https://arc.drpc.org')}
+                            className="px-2 py-1 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 rounded text-[10px] font-mono font-bold cursor-pointer"
+                          >
+                            dRPC 公共节点 (免 Key)
+                          </button>
+                          <button
+                            onClick={() => setCustomRpcUrl('https://arc-mainnet.infura.io/v3/YOUR_INFURA_KEY')}
+                            className="px-2 py-1 bg-amber-50 text-amber-700 hover:bg-amber-100 border border-amber-200 rounded text-[10px] font-mono font-bold cursor-pointer"
+                          >
+                            Infura 专线 (/v3/Key)
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => setCustomRpcUrl(`https://${activeNetwork.id}-mainnet.g.alchemy.com/v2/demo-key`)}
+                            className="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-[10px] font-mono cursor-pointer"
+                          >
+                            Alchemy
+                          </button>
+                          <button
+                            onClick={() => setCustomRpcUrl(`https://${activeNetwork.id}.infura.io/v3/demo-key`)}
+                            className="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-[10px] font-mono cursor-pointer"
+                          >
+                            Infura
+                          </button>
+                          <button
+                            onClick={() => setCustomRpcUrl(`https://${activeNetwork.id}.quiknode.pro/demo-key/`)}
+                            className="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-[10px] font-mono cursor-pointer"
+                          >
+                            QuickNode
+                          </button>
+                        </>
+                      )}
                       <button
                         onClick={() => setCustomRpcUrl('http://127.0.0.1:8545')}
                         className="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-[10px] font-mono cursor-pointer"
@@ -1910,8 +1253,19 @@ export const InteractiveTester: React.FC = () => {
             {/* Modal Footer */}
             <div className="flex items-center justify-end p-4 border-t border-slate-100 bg-slate-50 space-x-2">
               <button
-                onClick={() => setRpcModalOpen(false)}
-                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-medium rounded-xl text-xs cursor-pointer"
+                onClick={() => {
+                  if (useCustomRpc && customRpcUrl.trim()) {
+                    const normalized = normalizeRpcUrl(customRpcUrl);
+                    setCustomRpcUrl(normalized);
+                    testRpcPing(normalized);
+                    addLog('success', `[RPC 配置已更新] 私人专线节点: ${normalized}`);
+                  } else {
+                    testRpcPing(activeNetwork.defaultRpcUrl);
+                    addLog('info', `[RPC 配置已更新] 已切回默认节点: ${activeNetwork.defaultRpcUrl}`);
+                  }
+                  setRpcModalOpen(false);
+                }}
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs cursor-pointer shadow-xs transition-colors"
               >
                 保存并生效
               </button>

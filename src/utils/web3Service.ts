@@ -5,6 +5,7 @@ import {
   custom,
   parseEther,
   formatEther,
+  parseGwei,
   defineChain,
   isAddress,
   type PublicClient
@@ -237,18 +238,24 @@ export async function executeRealMulticallFund(options: {
 }): Promise<{ txHash: string; totalSent: number }> {
   const { rpcUrl, chainId, chainName, currency, explorerUrl, targets, useBrowserWallet, sponsorPrivateKey, onStatusUpdate } = options;
 
-  const totalAmount = targets.reduce((sum, t) => sum + t.amount, 0);
-  const totalValueWei = parseEther(totalAmount.toFixed(18));
   const chain = buildChainDefinition(chainId, chainName, currency, rpcUrl, explorerUrl);
   const publicClient = getPublicClient(rpcUrl, chainId);
 
-  // Prepare Multicall3 calls
-  const calls = targets.map((t) => ({
-    target: t.address as `0x${string}`,
-    allowFailure: false,
-    value: parseEther(t.amount.toFixed(18)),
-    callData: '0x' as `0x${string}`
-  }));
+  // Prepare Multicall3 calls and compute exact total Wei sum from BigInt to avoid float mismatch
+  const calls = targets.map((t) => {
+    // Format amount cleanly to prevent exponential notation or float precision loss
+    const amountStr = typeof t.amount === 'number' ? t.amount.toFixed(18).replace(/\.?0+$/, '') || '0' : String(t.amount);
+    return {
+      target: t.address as `0x${string}`,
+      allowFailure: false,
+      value: parseEther(amountStr),
+      callData: '0x' as `0x${string}`
+    };
+  });
+
+  // Calculate totalValueWei strictly by summing calls[i].value BigInts (Multicall3 requirement: msg.value == sum(call.value))
+  const totalValueWei = calls.reduce((acc, c) => acc + c.value, 0n);
+  const totalAmount = Number(formatEther(totalValueWei));
 
   onStatusUpdate?.(`已编码 Multicall3 aggregate3Value 调用，共包含 ${targets.length} 笔资金分发...`);
 
@@ -296,7 +303,10 @@ export async function executeRealMulticallFund(options: {
 
     onStatusUpdate?.(`正在通过 Sponsor 账户 ${account.address.slice(0, 10)}... 离线签名并广播交易...`);
 
-    txHash = await walletClient.writeContract({
+    // On Arc network (chainId: 5042), minimum gasPrice is 20 Gwei
+    const minGasPriceWei = chainId === 5042 ? parseGwei('20') : undefined;
+
+    const writeParams: any = {
       chain,
       account,
       address: MULTICALL3_ADDRESS,
@@ -304,7 +314,12 @@ export async function executeRealMulticallFund(options: {
       functionName: 'aggregate3Value',
       args: [calls],
       value: totalValueWei
-    });
+    };
+    if (minGasPriceWei) {
+      writeParams.gasPrice = minGasPriceWei;
+    }
+
+    txHash = await walletClient.writeContract(writeParams);
   }
 
   onStatusUpdate?.(`交易已广播至 ${chainName} 内存池！哈希: ${txHash}，正在等待出块确认...`);
@@ -343,13 +358,18 @@ export async function executeRealWithdrawFunds(options: {
   const chain = buildChainDefinition(chainId, chainName, currency, rpcUrl, explorerUrl);
   const publicClient = getPublicClient(rpcUrl, chainId);
 
-  // Get current gas price
-  const gasPrice = await publicClient.getGasPrice();
+  // Get current gas price and enforce minimum gas floor (Arc chainId 5042 is minimum 20 Gwei)
+  let gasPrice = await publicClient.getGasPrice();
+  const minGasFloorWei = chainId === 5042 ? parseGwei('20') : 0n;
+  if (gasPrice < minGasFloorWei) {
+    gasPrice = minGasFloorWei;
+  }
   const gasLimit = 21000n;
   const gasCostWei = gasLimit * gasPrice;
   const gasCostEth = parseFloat(formatEther(gasCostWei));
 
-  onStatusUpdate?.(`网络基准 Gas Price: ${formatEther(gasPrice * 1000000000n)} Gwei | 单笔转账预估 Gas: ${gasCostEth.toFixed(6)} ${currency}`);
+  const displayGwei = (Number(gasPrice) / 1e9).toFixed(2);
+  onStatusUpdate?.(`网络基准 Gas Price: ${displayGwei} Gwei${chainId === 5042 ? ' (已锁定 Arc 最低下限 20 Gwei)' : ''} | 单笔转账预估 Gas: ${gasCostEth.toFixed(6)} ${currency}`);
 
   let totalRecovered = 0;
   const transfers: Array<{ address: string; txHash: string; recovered: number; error?: string }> = [];
@@ -396,7 +416,8 @@ export async function executeRealWithdrawFunds(options: {
         account,
         to: recipientAddress as `0x${string}`,
         value: sendValueWei,
-        gas: gasLimit
+        gas: gasLimit,
+        gasPrice
       } as any);
 
       totalRecovered += sendValueEth;
@@ -420,4 +441,129 @@ export async function executeRealWithdrawFunds(options: {
     totalRecovered,
     transfers
   };
+}
+
+/**
+ * Execute real on-chain mint transaction across wallets
+ */
+export async function executeRealOnChainMint(options: {
+  rpcUrl: string;
+  chainId: number;
+  chainName: string;
+  currency: string;
+  contractAddress: string;
+  mintPrice: number;
+  wallets: Array<{ address: string; privateKey: string; quantity: number }>;
+  onStatusUpdate?: (msg: string) => void;
+}): Promise<{
+  results: Array<{
+    address: string;
+    txHash: string;
+    success: boolean;
+    error?: string;
+    mintedCount: number;
+  }>;
+}> {
+  const { rpcUrl, chainId, chainName, currency, contractAddress, mintPrice, wallets, onStatusUpdate } = options;
+
+  if (!isAddress(contractAddress)) {
+    throw new Error(`目标抢购合约地址格式不合规: ${contractAddress}`);
+  }
+
+  const publicClient = getPublicClient(rpcUrl, chainId);
+  const chain = buildChainDefinition(chainId, chainName, currency, rpcUrl, '');
+
+  onStatusUpdate?.(`[真实链上检查] 正在向 ${chainName} RPC 探查合约 ${contractAddress.slice(0, 10)}... 部署字节码...`);
+
+  // Verify real bytecode
+  const bytecode = await publicClient.getBytecode({ address: contractAddress as `0x${string}` });
+  if (!bytecode || bytecode === '0x' || bytecode.length <= 2) {
+    throw new Error(`[真实链上拦截] 目标合约 ${contractAddress} 在 ${chainName} (Chain ID: ${chainId}) 尚未部署字节码（未上线或已销毁），无法在主网执行真实 Mint！拒绝伪造模拟数据。`);
+  }
+
+  // Enforce gas floor for Arc (20 Gwei minimum)
+  let gasPrice = await publicClient.getGasPrice();
+  const minGasFloorWei = chainId === 5042 ? parseGwei('20') : 0n;
+  if (gasPrice < minGasFloorWei) {
+    gasPrice = minGasFloorWei;
+  }
+
+  const results: Array<{
+    address: string;
+    txHash: string;
+    success: boolean;
+    error?: string;
+    mintedCount: number;
+  }> = [];
+
+  for (const w of wallets) {
+    try {
+      if (!w.privateKey || !w.privateKey.startsWith('0x') || w.privateKey.length !== 66) {
+        throw new Error('私钥缺失或格式错误，无法完成离线签名');
+      }
+
+      const account = privateKeyToAccount(w.privateKey as `0x${string}`);
+      const balanceWei = await publicClient.getBalance({ address: account.address });
+      const balanceEth = parseFloat(formatEther(balanceWei));
+
+      const totalMintCostWei = parseEther((mintPrice * w.quantity).toString());
+      const estimatedGasWei = 150000n * gasPrice;
+      const totalRequiredWei = totalMintCostWei + estimatedGasWei;
+
+      if (balanceWei < totalRequiredWei) {
+        throw new Error(
+          `链上真实余额不足: 需 ${parseFloat(formatEther(totalRequiredWei)).toFixed(4)} ${currency} (含 Gas)，当前仅有 ${balanceEth.toFixed(4)} ${currency}`
+        );
+      }
+
+      const walletClient = createWalletClient({
+        account,
+        chain,
+        transport: http(rpcUrl)
+      });
+
+      onStatusUpdate?.(`[签名广播] 钱包 ${account.address.slice(0, 8)}... 正在向主网广播真实抢购交易...`);
+
+      const txHash = await walletClient.sendTransaction({
+        chain,
+        account,
+        to: contractAddress as `0x${string}`,
+        value: totalMintCostWei,
+        gas: 150000n,
+        gasPrice
+      } as any);
+
+      onStatusUpdate?.(`[主网已入池] 钱包 ${account.address.slice(0, 8)}... 交易哈希: ${txHash}，正在等待出块确认...`);
+
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60000 });
+
+      if (receipt.status === 'success') {
+        results.push({
+          address: w.address,
+          txHash,
+          success: true,
+          mintedCount: w.quantity
+        });
+      } else {
+        results.push({
+          address: w.address,
+          txHash,
+          success: false,
+          error: '链上执行 Revert (合约执行已回滚)',
+          mintedCount: 0
+        });
+      }
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      results.push({
+        address: w.address,
+        txHash: '',
+        success: false,
+        error: errMsg.slice(0, 80),
+        mintedCount: 0
+      });
+    }
+  }
+
+  return { results };
 }

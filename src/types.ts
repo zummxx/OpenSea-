@@ -51,3 +51,46 @@ export interface SecurityRisk {
   description: string;
   recommendation: string;
 }
+
+export interface TestWallet {
+  id: number;
+  address: string;
+  privateKey: string;
+  quantity: number;
+  nativeBalance: number;
+  isDelegated: boolean; // EIP-7702 delegated
+  status: 'idle' | 'ready' | 'fetching_calldata' | 'broadcasting' | 'success' | 'reverted';
+  txHash?: string;
+  mintedNftCount: number;
+  errorMsg?: string;
+}
+
+export interface LogEntry {
+  timestamp: string;
+  level: 'info' | 'warn' | 'error' | 'success' | 'cmd';
+  message: string;
+}
+
+export interface NetworkConfig {
+  id: string;
+  name: string;
+  chainId: number;
+  currency: string;
+  defaultRpcUrl: string;
+  explorerUrl: string;
+  supports7702: boolean;
+  supports1153: boolean;
+  isTestnet?: boolean;
+  badgeColor: string;
+  blockTimeSec: number;
+  avgGasGwei: number;
+  minGasGwei?: number;
+}
+
+export interface DropInfo {
+  name: string;
+  collectionSlug: string;
+  contractAddress: string;
+  mintPrice: number;
+  activeStage: string;
+}
