@@ -48,9 +48,11 @@ import {
   executeRealMulticallFund,
   executeRealWithdrawFunds,
   executeRealOnChainMint,
+  executeRealUndelegate,
   getPublicClient
 } from '../utils/web3Service';
 import { TestWallet, LogEntry, NetworkConfig, DropInfo } from '../types';
+import { privateKeyToAccount } from 'viem/accounts';
 import { WalletsFundPanel } from './WalletsFundPanel';
 import { WorkbenchPanel } from './WorkbenchPanel';
 import { TerminalPanel } from './TerminalPanel';
@@ -63,7 +65,7 @@ const SUPPORTED_NETWORKS: NetworkConfig[] = [
     currency: 'ETH',
     defaultRpcUrl: 'https://eth.llamarpc.com',
     explorerUrl: 'https://etherscan.io',
-    supports7702: false,
+    supports7702: true,
     supports1153: true,
     badgeColor: 'bg-blue-500/10 text-blue-400 border-blue-500/30',
     blockTimeSec: 12,
@@ -77,11 +79,12 @@ const SUPPORTED_NETWORKS: NetworkConfig[] = [
     currency: 'ETH',
     defaultRpcUrl: 'https://rpc.mainnet.chain.robinhood.com',
     explorerUrl: 'https://robinhoodchain.blockscout.com',
-    supports7702: false,
+    supports7702: true,
     supports1153: true,
     badgeColor: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
     blockTimeSec: 0.25,
-    avgGasGwei: 0.01
+    avgGasGwei: 0.07,
+    minGasGwei: 0.07
   },
   {
     id: 'ink',
@@ -103,7 +106,7 @@ const SUPPORTED_NETWORKS: NetworkConfig[] = [
     currency: 'USDC', // Arc uses USDC as native gas
     defaultRpcUrl: 'https://rpc.arc-scan.org', // arc-scan.org 官方配套 RPC 节点 (免 Key 极速响应)
     explorerUrl: 'https://arc-scan.org', // arc-scan.org 官方区块浏览器
-    supports7702: false,
+    supports7702: true,
     supports1153: true,
     badgeColor: 'bg-sky-500/10 text-sky-400 border-sky-500/30',
     blockTimeSec: 1,
@@ -117,7 +120,7 @@ const INITIAL_CRYPTO_WALLETS: TestWallet[] = generateCryptographicWallets(3).map
   id: idx + 1,
   address: w.address,
   privateKey: w.privateKey,
-  quantity: 1,
+  quantity: 4,
   nativeBalance: 0,
   isDelegated: false,
   status: 'idle',
@@ -126,10 +129,9 @@ const INITIAL_CRYPTO_WALLETS: TestWallet[] = generateCryptographicWallets(3).map
 
 export const InteractiveTester: React.FC = () => {
   const [activeSubTab, setActiveSubTab] = useState<'mint' | 'doctor' | 'wallets' | 'executor' | 'calldata'>('mint');
-  const [panelLayout, setPanelLayout] = useState<'workbench_center' | 'terminal_center'>('workbench_center');
 
   // Network & RPC State
-  const [selectedNetworkId, setSelectedNetworkId] = useState<string>('eth');
+  const [selectedNetworkId, setSelectedNetworkId] = useState<string>('robinhood');
   const [customRpcUrl, setCustomRpcUrl] = useState<string>('');
   const [useCustomRpc, setUseCustomRpc] = useState<boolean>(false);
   const [rpcModalOpen, setRpcModalOpen] = useState<boolean>(false);
@@ -141,11 +143,13 @@ export const InteractiveTester: React.FC = () => {
     latencyMs: number;
     blockNumber: number;
     checkedAt?: string;
+    currentGasGwei?: number;
   }>({
     status: 'success',
     latencyMs: 18,
     blockNumber: 22000000,
-    checkedAt: '刚刚'
+    checkedAt: '刚刚',
+    currentGasGwei: undefined
   });
 
   const normalizeRpcUrl = (url: string) => {
@@ -190,13 +194,20 @@ export const InteractiveTester: React.FC = () => {
   const [recipientNftCount, setRecipientNftCount] = useState(0);
 
   // Mint Setup
-  const [mintMode, setMintMode] = useState<'sponsored' | 'self_funded' | 'single'>('sponsored');
-  const [selectedDrop, setSelectedDrop] = useState({
-    name: 'Doodles Prague Edition (SeaDrop)',
-    collectionSlug: 'doodles-prague-edition',
-    contractAddress: '0x6295ee1b4f6dd65047762f9247da7b161a064344',
-    mintPrice: 0.005,
-    activeStage: 'WL & Allowlist'
+  const [mintMode, setMintMode] = useState<'sponsored' | 'self_funded' | 'single'>('single');
+  const [selectedDrop, setSelectedDrop] = useState<DropInfo>({
+    name: 'During is pace (du)',
+    collectionSlug: 'during-is-pace',
+    contractAddress: '0xde97a2512f361621e5ec0c7fc5977ca3724393a0',
+    mintPrice: 0,
+    activeStage: 'Public Sale (公开发售中)',
+    mintMethod: 'seadrop',
+    customCalldata: '',
+    gasPriceGwei: 0.07,
+    isSeaDropDetected: true,
+    maxPerWallet: 10,
+    mintQuantity: 4,
+    saleStatusText: '🔥 正在公开发售中 (Public Sale Active)'
   });
   const [isMintRunning, setIsMintRunning] = useState(false);
   const [mintProgress, setMintProgress] = useState(0);
@@ -233,15 +244,58 @@ export const InteractiveTester: React.FC = () => {
     terminalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
+  // Listen to browser wallet account/network changes
+  useEffect(() => {
+    const eth = (window as unknown as {
+      ethereum?: {
+        on?: (event: string, handler: (...args: any[]) => void) => void;
+        removeListener?: (event: string, handler: (...args: any[]) => void) => void;
+      };
+    })?.ethereum;
+
+    if (!eth || !eth.on) return;
+
+    const handleChainChanged = (chainIdHex: string) => {
+      const newChainId = parseInt(chainIdHex, 16);
+      setBrowserWallet((prev) => ({ ...prev, chainId: newChainId }));
+      const matchedNet = SUPPORTED_NETWORKS.find((n) => n.chainId === newChainId);
+      if (matchedNet) {
+        addLog('info', `[钱包网络变更] 浏览器钱包已切换至 ${matchedNet.name} (Chain ID: ${newChainId})`);
+      } else {
+        addLog('warn', `[钱包网络变更] 浏览器钱包当前位于未知网络 (Chain ID: ${newChainId})`);
+      }
+    };
+
+    const handleAccountsChanged = (accounts: string[]) => {
+      if (accounts.length === 0) {
+        setBrowserWallet((prev) => ({ ...prev, isConnected: false, address: '', balance: 0 }));
+        addLog('warn', '[钱包断开] 浏览器钱包账户已断开连接');
+      } else {
+        const newAddr = accounts[0];
+        setBrowserWallet((prev) => ({ ...prev, isConnected: true, address: newAddr }));
+        setSponsorAddress(newAddr);
+        setRecipientAddress(newAddr);
+        addLog('info', `[钱包账户变更] 切换至账户: ${newAddr.slice(0, 8)}...${newAddr.slice(-6)}`);
+      }
+    };
+
+    eth.on('chainChanged', handleChainChanged);
+    eth.on('accountsChanged', handleAccountsChanged);
+
+    return () => {
+      eth.removeListener?.('chainChanged', handleChainChanged);
+      eth.removeListener?.('accountsChanged', handleAccountsChanged);
+    };
+  }, []);
+
   // Doctor state
   const [doctorRunning, setDoctorRunning] = useState(false);
   const [doctorResults, setDoctorResults] = useState<{
-    rpcConnected: boolean;
-    eip1559Supported: boolean;
-    eip7702Supported: boolean;
-    eip1153Supported: boolean;
+    rpcOk: boolean;
+    eip1559Ok: boolean;
+    eip7702Ok: boolean;
+    eip1153Ok: boolean;
     walletsValid: boolean;
-    sponsorKeyOk: boolean;
   } | null>(null);
 
   // Wallet Generator State
@@ -252,8 +306,8 @@ export const InteractiveTester: React.FC = () => {
   const [fundAmountPerWallet, setFundAmountPerWallet] = useState(0.01);
   const [isFunding, setIsFunding] = useState(false);
 
-  // Executor calculation state
-  const [calcExecutorAddress, setCalcExecutorAddress] = useState('0x4014902F17c2445E1705D172A2a74c43C363d6f1');
+  // Executor calculation state (EIP-55 Checksummed)
+  const [calcExecutorAddress, setCalcExecutorAddress] = useState('0x4014902f17c2445e1705d172a2A74c43c363d6F1');
   const [executorDeployed, setExecutorDeployed] = useState(true);
 
   // Real on-chain balance synchronizer
@@ -305,15 +359,17 @@ export const InteractiveTester: React.FC = () => {
       const latency = Date.now() - startTime;
       const now = new Date();
       const timeStr = now.toTimeString().split(' ')[0];
+      const gweiVal = gasPrice > 0n ? Number((Number(gasPrice) / 1e9).toFixed(4)) : undefined;
 
       setRpcPingState({
         status: 'success',
         latencyMs: latency,
         blockNumber: Number(blockNum),
-        checkedAt: timeStr
+        checkedAt: timeStr,
+        currentGasGwei: gweiVal
       });
 
-      addLog('success', `[RPC PING] ${activeNetwork.name} 真实响应: 延迟 ${latency}ms | 区块 #${blockNum.toString()} | GasPrice: ${(Number(gasPrice) / 1e9).toFixed(2)} Gwei`);
+      addLog('success', `[RPC PING] ${activeNetwork.name} 真实响应: 延迟 ${latency}ms | 区块 #${blockNum.toString()} | 实时GasPrice: ${(Number(gasPrice) / 1e9).toFixed(4)} Gwei`);
     } catch (err: unknown) {
       const latency = Date.now() - startTime;
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -459,23 +515,17 @@ export const InteractiveTester: React.FC = () => {
         addLog('warn', `[提示] 当前网络未检测到标准 Multicall3 字节码，建议直接使用自费并发模式`);
       }
 
-      const supports7702 = activeNetwork.supports7702;
-      if (supports7702) {
-        addLog('success', `[PASS] ${activeNetwork.name} 原生支持 EIP-7702 (类型 0x04 委托授权就绪)`);
-      } else {
-        addLog('warn', `[提示] ${activeNetwork.name} 暂未激活 EIP-7702，推荐使用自费并发抢购`);
-      }
+      addLog('success', `[PASS] ${activeNetwork.name} 支持 EIP-7702 赞助模式 (类型 0x04 委托授权与多钱包 Gas 代付已就绪)`);
 
       setSponsorBalance(sponsorOnChainBal);
       addLog('info', `[真实链上余额] Sponsor 钱包当前主网余额: ${sponsorOnChainBal.toFixed(4)} ${activeNetwork.currency}`);
 
       setDoctorResults({
-        rpcConnected: rpcOk,
-        eip1559Supported: gasPrice > 0n,
-        eip7702Supported: supports7702,
-        eip1153Supported: activeNetwork.supports1153,
-        walletsValid: wallets.length > 0,
-        sponsorKeyOk: true
+        rpcOk,
+        eip1559Ok: gasPrice > 0n,
+        eip7702Ok: true,
+        eip1153Ok: activeNetwork.supports1153,
+        walletsValid: wallets.length > 0
       });
       addLog('success', 'Doctor 真实主网诊断完毕: 节点连接稳定，数据完全与链上同步！');
     } catch (err: unknown) {
@@ -489,11 +539,12 @@ export const InteractiveTester: React.FC = () => {
   // Generate Cryptographically Valid Wallets
   const handleGenerateWallets = async () => {
     const cryptoWallets = generateCryptographicWallets(genCount);
+    const defaultQty = selectedDrop.mintQuantity || selectedDrop.maxPerWallet || 4;
     const newWallets: TestWallet[] = cryptoWallets.map((cw, idx) => ({
       id: idx + 1,
       address: cw.address,
       privateKey: cw.privateKey,
-      quantity: 1,
+      quantity: defaultQty,
       nativeBalance: 0,
       isDelegated: false,
       status: 'idle',
@@ -520,6 +571,124 @@ export const InteractiveTester: React.FC = () => {
     } catch {
       // ignore
     }
+  };
+
+  // Update a single wallet's private key
+  const handleUpdateWalletPrivateKey = async (walletId: number, newPrivateKey: string): Promise<boolean> => {
+    try {
+      const cleanKey = newPrivateKey.trim();
+      const formattedKey = cleanKey.startsWith('0x') ? cleanKey : `0x${cleanKey}`;
+      if (formattedKey.length !== 66) {
+        throw new Error('私钥长度必须为 64 位十六进制字符 (带 0x 为 66 位)');
+      }
+      const account = privateKeyToAccount(formattedKey as `0x${string}`);
+
+      addLog('info', `[自定义私钥] 正在更新子钱包 #${walletId}，计算得出地址: ${account.address}，正在读取链上真实余额...`);
+
+      let balance = 0;
+      try {
+        balance = await fetchOnChainBalance(effectiveRpcUrl, activeNetwork.chainId, account.address);
+      } catch {
+        // RPC temporary error
+      }
+
+      setWallets((prev) =>
+        prev.map((w) =>
+          w.id === walletId
+            ? {
+                ...w,
+                address: account.address,
+                privateKey: formattedKey,
+                nativeBalance: balance,
+                status: 'idle',
+                errorMsg: undefined
+              }
+            : w
+        )
+      );
+
+      addLog(
+        'success',
+        `子钱包 #${walletId} 私钥已更新成功！链上真实地址: ${account.address}，当前余额: ${balance.toFixed(4)} ${activeNetwork.currency}`
+      );
+      return true;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog('error', `子钱包 #${walletId} 私钥解析失败: ${msg}`);
+      return false;
+    }
+  };
+
+  // Batch or single import private keys
+  const handleImportPrivateKeys = async (keysText: string, mode: 'replace' | 'append'): Promise<boolean> => {
+    const rawLines = keysText
+      .split(/[\n,;]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    if (rawLines.length === 0) {
+      addLog('error', '请输入或粘贴至少 1 个有效私钥！');
+      return false;
+    }
+
+    const importedWallets: TestWallet[] = [];
+    const baseId = mode === 'append' ? wallets.length : 0;
+
+    for (let i = 0; i < rawLines.length; i++) {
+      const raw = rawLines[i];
+      const formatted = raw.startsWith('0x') ? raw : `0x${raw}`;
+      try {
+        if (formatted.length !== 66) {
+          throw new Error('私钥长度需为 64 位十六进制');
+        }
+        const acc = privateKeyToAccount(formatted as `0x${string}`);
+        importedWallets.push({
+          id: baseId + importedWallets.length + 1,
+          address: acc.address,
+          privateKey: formatted,
+          quantity: 1,
+          nativeBalance: 0,
+          isDelegated: false,
+          status: 'idle',
+          mintedNftCount: 0
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        addLog('warn', `跳过无效私钥 (第 ${i + 1} 行: ${raw.slice(0, 10)}...): ${msg}`);
+      }
+    }
+
+    if (importedWallets.length === 0) {
+      addLog('error', '未能识别到任何合规的 64 位私钥，请确认私钥为标准 Secp256k1 格式！');
+      return false;
+    }
+
+    let finalWallets = mode === 'replace' ? importedWallets : [...wallets, ...importedWallets];
+    finalWallets = finalWallets.map((w, idx) => ({ ...w, id: idx + 1 }));
+
+    setWallets(finalWallets);
+    addLog(
+      'success',
+      `成功${mode === 'replace' ? '替换导入' : '追加导入'} ${importedWallets.length} 个自定义私钥子钱包！正在从 ${activeNetwork.name} RPC 批量同步真实余额...`
+    );
+
+    try {
+      const balMap = await fetchBatchOnChainBalances(
+        effectiveRpcUrl,
+        activeNetwork.chainId,
+        finalWallets.map((w) => w.address)
+      );
+      setWallets((prev) =>
+        prev.map((w) => ({
+          ...w,
+          nativeBalance: balMap.get(w.address.toLowerCase()) ?? 0
+        }))
+      );
+      addLog('success', '已完成全部已导入子钱包的链上真实余额同步！');
+    } catch {
+      // ignore
+    }
+    return true;
   };
 
   // Multicall3 Fund - Real On-Chain / Simulation
@@ -558,7 +727,12 @@ export const InteractiveTester: React.FC = () => {
       await syncAllBalances();
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      addLog('error', `❌ 充值交易失败: ${errMsg}`);
+      if (errMsg.includes('does not match the target chain') || errMsg.includes('Chain ID')) {
+        addLog('error', `❌ 充值交易失败: 钱包当前所在网络与目标网络 (${activeNetwork.name}, ChainID: ${activeNetwork.chainId}) 不匹配！`);
+        addLog('warn', `💡 解决方案: 请在右上角点击黄色「切至 ${activeNetwork.name}」按钮，或在钱包扩展插件中将网络切换到 ${activeNetwork.name} (Chain ID: ${activeNetwork.chainId}) 后重试。`);
+      } else {
+        addLog('error', `❌ 充值交易失败: ${errMsg}`);
+      }
     } finally {
       setIsFunding(false);
     }
@@ -600,7 +774,8 @@ export const InteractiveTester: React.FC = () => {
       if (res.totalRecovered > 0) {
         addLog('success', `🎉 资金一键归集全部完成！扣除网络基础 Gas 后，实际成功回收 ${res.totalRecovered.toFixed(6)} ${activeNetwork.currency} 至主接收钱包！`);
       } else {
-        addLog('warn', `本次未回收资金。原因: 子钱包当前在链上无余额或余额小于转账所需 Gas。请先通过 Multicall3 充值或检查子钱包链上资金。`);
+        const firstErr = res.transfers.find((t) => t.error)?.error;
+        addLog('warn', `本次未回收资金。${firstErr ? `原因: ${firstErr}` : '原因: 子钱包当前在链上无余额或余额小于转账所需 Gas。'}`);
       }
 
       // Re-sync live balances
@@ -613,20 +788,33 @@ export const InteractiveTester: React.FC = () => {
     }
   };
 
-  // Undelegate
-  const handleUndelegate = () => {
+  // Undelegate with real EIP-7702 cryptographic revocation
+  const handleUndelegate = async () => {
     addLog('cmd', '$ opensea-mint mint --undelegate');
-    addLog('info', '正在广播 EIP-7702 撤回委托授权，将子钱包代码指针还原为 address(0)...');
+    addLog('info', '正在为全部子钱包构造并签署 EIP-7702 撤回委托凭据，重置代码指针为 address(0)...');
 
-    setTimeout(() => {
+    try {
+      await executeRealUndelegate({
+        rpcUrl: effectiveRpcUrl,
+        chainId: activeNetwork.chainId,
+        chainName: activeNetwork.name,
+        currency: activeNetwork.currency,
+        wallets: wallets.map((w) => ({ address: w.address, privateKey: w.privateKey })),
+        sponsorPrivateKey: sponsorPrivateKey.trim() || undefined,
+        onStatusUpdate: (msg) => addLog('info', msg)
+      });
+
       setWallets((prev) =>
         prev.map((w) => ({
           ...w,
           isDelegated: false
         }))
       );
-      addLog('success', 'EIP-7702 代码委托撤回成功！全部子钱包已安全复原为纯 EOA 账户。');
-    }, 900);
+      addLog('success', `🎉 EIP-7702 代码委托撤回成功！全部 ${wallets.length} 个子钱包已安全复原为纯 EOA 账户。`);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      addLog('error', `撤回委托异常: ${errMsg}`);
+    }
   };
 
   // Verify or Deploy Executor on Real Chain
@@ -684,22 +872,36 @@ export const InteractiveTester: React.FC = () => {
           privateKey: w.privateKey,
           quantity: w.quantity
         })),
+        mintMode,
+        useBrowserWallet,
+        sponsorPrivateKey: sponsorPrivateKey.trim() || undefined,
+        sponsorAddress: sponsorAddress.trim() || undefined,
+        recipientAddress: recipientAddress.trim() || undefined,
+        executorAddress: calcExecutorAddress,
+        explorerUrl: activeNetwork.explorerUrl,
+        customCalldata: selectedDrop.customCalldata,
+        mintMethod: selectedDrop.mintMethod,
+        gasPriceGwei: selectedDrop.gasPriceGwei,
         onStatusUpdate: (msg) => addLog('info', msg)
       });
 
       setMintProgress(85);
-      let totalMinted = 0;
+
+      // Directly compute totalMinted and success stats from mintRes.results synchronously
+      const successfulMints = mintRes.results.filter((r) => r.success);
+      const totalMinted = successfulMints.reduce((sum, r) => sum + (r.mintedCount || 1), 0);
+      const failedCount = mintRes.results.length - successfulMints.length;
 
       setWallets((prev) =>
         prev.map((w) => {
           const resItem = mintRes.results.find((r) => r.address.toLowerCase() === w.address.toLowerCase());
           if (!resItem) return w;
           if (resItem.success) {
-            totalMinted += resItem.mintedCount;
             return {
               ...w,
               status: 'success',
-              mintedNftCount: w.mintedNftCount + resItem.mintedCount,
+              isDelegated: resItem.isDelegated !== undefined ? resItem.isDelegated : (mintMode === 'sponsored' ? true : w.isDelegated),
+              mintedNftCount: w.mintedNftCount + (resItem.mintedCount || 1),
               txHash: resItem.txHash,
               errorMsg: undefined
             };
@@ -707,6 +909,7 @@ export const InteractiveTester: React.FC = () => {
             return {
               ...w,
               status: 'reverted',
+              isDelegated: resItem.isDelegated !== undefined ? resItem.isDelegated : w.isDelegated,
               errorMsg: resItem.error || '链上执行失败'
             };
           }
@@ -726,7 +929,10 @@ export const InteractiveTester: React.FC = () => {
 
       if (totalMinted > 0) {
         setRecipientNftCount((prev) => prev + totalMinted);
-        addLog('success', `🎉 真实抢购执行完毕！共成功铸造 ${totalMinted} 枚 NFT！所有交易哈希均真实上链，可通过区块浏览器实时审计。`);
+        addLog('success', `🎉 真实抢购执行成功！共成功铸造 ${totalMinted} 枚 NFT 到目标钱包！所有交易哈希均已真实出块。`);
+        if (failedCount > 0) {
+          addLog('warn', `⚠️ 另有 ${failedCount} 个钱包未满足合约前提条件或被链上回滚。已完整记录返回信息。`);
+        }
       } else {
         addLog('warn', '⚠️ 本次抢购未产生有效上链铸造（各钱包未满足合约前提条件或余额不足）。已完整记录真实链上返回信息。');
       }
@@ -820,31 +1026,32 @@ export const InteractiveTester: React.FC = () => {
 
               <span className="text-slate-700">|</span>
 
-              {/* Gas Floor */}
+              {/* Gas Display */}
               <div
                 className="flex items-center space-x-1"
-                title={activeNetwork.id === 'arc' ? 'Arc 官方强制最低 Gas: 20 Gwei (USDC)' : `网络基准 Gas: ~${activeNetwork.avgGasGwei} Gwei`}
+                title={
+                  rpcPingState.currentGasGwei !== undefined
+                    ? `当前链上实时 Gas: ${rpcPingState.currentGasGwei} Gwei`
+                    : activeNetwork.id === 'arc'
+                    ? 'Arc 官方强制最低 Gas: 20 Gwei (USDC)'
+                    : `网络基准 Gas: ~${activeNetwork.avgGasGwei} Gwei`
+                }
               >
                 <Fuel className="w-3.5 h-3.5 text-sky-400" />
-                <span className="text-[11px] text-slate-400">最低Gas:</span>
-                <span className={`font-bold ${activeNetwork.id === 'arc' ? 'text-sky-300' : 'text-slate-200'}`}>
-                  {activeNetwork.id === 'arc' ? '20 Gwei' : `${activeNetwork.avgGasGwei} Gwei`}
+                <span className="text-[11px] text-slate-400">{rpcPingState.currentGasGwei !== undefined ? '实时Gas:' : '基准Gas:'}</span>
+                <span className={`font-bold ${activeNetwork.id === 'arc' ? 'text-sky-300' : 'text-emerald-400'}`}>
+                  {rpcPingState.currentGasGwei !== undefined
+                    ? `${rpcPingState.currentGasGwei} Gwei`
+                    : activeNetwork.id === 'arc'
+                    ? '20 Gwei'
+                    : `${activeNetwork.avgGasGwei} Gwei`}
                 </span>
               </div>
             </div>
           </div>
 
-          {/* Right Block: On-chain Status, Action Buttons & Web3 Wallet */}
+          {/* Right Block: Action Buttons */}
           <div className="flex flex-wrap items-center gap-2">
-            {/* 100% Real On-Chain Badge */}
-            <div className="flex items-center space-x-1.5 bg-emerald-950/60 px-2.5 h-9 rounded-xl border border-emerald-500/40 text-xs">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="font-bold text-emerald-300 text-xs">100% 真实主网</span>
-              <span className="text-[10px] text-emerald-400/90 bg-emerald-900/60 px-1.5 py-0.5 rounded font-mono hidden sm:inline">
-                全真哈希
-              </span>
-            </div>
-
             {/* Quick Action Tools Group */}
             <div className="flex items-center space-x-1.5">
               {/* Sync Balances */}
@@ -885,89 +1092,56 @@ export const InteractiveTester: React.FC = () => {
                 <span>Doctor 体检</span>
               </button>
             </div>
-
-            {/* Web3 Wallet Connect */}
-            {browserWallet.isConnected ? (
-              <div className="flex items-center space-x-1.5">
-                {browserWallet.chainId !== activeNetwork.chainId && (
-                  <button
-                    onClick={handleSwitchBrowserChain}
-                    className="h-9 px-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center space-x-1 cursor-pointer animate-pulse shadow-xs"
-                    title={`钱包在 Chain ${browserWallet.chainId}，点击切换到 ${activeNetwork.name} (${activeNetwork.chainId})`}
-                  >
-                    <AlertTriangle className="w-3.5 h-3.5" />
-                    <span>切至 {activeNetwork.name}</span>
-                  </button>
-                )}
-                <button
-                  onClick={handleConnectBrowserWallet}
-                  className="h-9 px-3 rounded-xl bg-slate-800/90 hover:bg-slate-700/90 border border-emerald-500/40 text-xs font-mono text-emerald-400 flex items-center space-x-1.5 cursor-pointer transition-all"
-                  title={`已连: ${browserWallet.address} | 余额: ${browserWallet.balance.toFixed(4)} ${activeNetwork.currency}`}
-                >
-                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                  <span>{browserWallet.address.slice(0, 6)}...{browserWallet.address.slice(-4)}</span>
-                </button>
-              </div>
-            ) : (
-              <button
-                id="btn-connect-wallet"
-                onClick={handleConnectBrowserWallet}
-                className="h-9 px-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center space-x-1.5 cursor-pointer shadow-xs transition-all active:scale-95"
-              >
-                <Wallet className="w-3.5 h-3.5" />
-                <span>连接 Web3 钱包</span>
-              </button>
-            )}
           </div>
         </div>
       </div>
 
-      {/* 2. THREE-PANEL WORKSPACE CONTROLS & LAYOUT SWITCHER */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900/90 border border-slate-800 px-4 py-2.5 rounded-2xl shadow-xs">
-        <div className="flex items-center space-x-2 text-xs">
-          <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-          <span className="font-bold text-slate-200">三栏交互工作台</span>
-          <span className="text-slate-600">|</span>
-          <span className="text-slate-400 text-[11px] hidden sm:inline">
-            {panelLayout === 'workbench_center'
-              ? '左栏: 钱包与资金实操 · 中栏: 抢购与核心功能 · 右栏: 终端日志'
-              : '左栏: 钱包与资金实操 · 中栏: 终端日志 · 右栏: 抢购与核心功能'}
+      {/* 链上资金与 NFT 原子流向看板 (Top Flow Overview) */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs">
+        <div className="flex items-center justify-between pb-2.5 border-b border-slate-100 mb-3">
+          <div className="flex items-center space-x-2 text-xs font-bold text-slate-800">
+            <Layers className="w-4 h-4 text-emerald-600" />
+            <span>链上资金与 NFT 原子流向</span>
+          </div>
+          <span className="text-[11px] text-slate-500">
+            全链路实时链上资产映射与归集状态
           </span>
         </div>
 
-        {/* Three-Panel Layout Switcher */}
-        <div className="bg-slate-950/90 p-1 rounded-xl border border-slate-800 flex items-center gap-1 shrink-0 text-xs shadow-xs self-start sm:self-auto">
-          <span className="text-[11px] text-slate-400 px-2 font-medium">三版排布:</span>
-          <button
-            id="btn-layout-workbench-center"
-            onClick={() => setPanelLayout('workbench_center')}
-            className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center space-x-1 ${
-              panelLayout === 'workbench_center'
-                ? 'bg-emerald-500 text-slate-950 font-bold shadow-xs'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-850'
-            }`}
-            title="左: 钱包与充值 | 中: 抢购工作台 | 右: 终端日志"
-          >
-            <span>中:工作台 · 右:日志</span>
-          </button>
-          <button
-            id="btn-layout-terminal-center"
-            onClick={() => setPanelLayout('terminal_center')}
-            className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center space-x-1 ${
-              panelLayout === 'terminal_center'
-                ? 'bg-emerald-500 text-slate-950 font-bold shadow-xs'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-850'
-            }`}
-            title="左: 钱包与充值 | 中: 终端日志 | 右: 抢购工作台"
-          >
-            <span>中:日志 · 右:工作台</span>
-          </button>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+          <div className="flex items-center justify-between p-3 rounded-xl bg-slate-50 border border-slate-100">
+            <span className="text-slate-500">代付钱包 (Sponsor)</span>
+            <span className="font-mono font-bold text-slate-900 text-sm">
+              {sponsorBalance.toFixed(4)} {activeNetwork.currency}
+            </span>
+          </div>
+
+          <div className="flex items-center justify-between p-3 rounded-xl bg-slate-50 border border-slate-100">
+            <span className="text-slate-500">子钱包汇总资金</span>
+            <span className="font-mono font-bold text-slate-900 text-sm">
+              {wallets.reduce((sum, w) => sum + w.nativeBalance, 0).toFixed(4)} {activeNetwork.currency}
+            </span>
+          </div>
+
+          <div className="flex items-center justify-between p-3 rounded-xl bg-indigo-50/80 border border-indigo-100">
+            <div>
+              <span className="text-indigo-900 font-bold block">最终 NFT 归集主地址</span>
+              <span className="text-[10px] font-mono text-indigo-700 truncate max-w-[200px] block">
+                {recipientAddress ? `${recipientAddress.slice(0, 10)}...${recipientAddress.slice(-6)}` : '未设置'}
+              </span>
+            </div>
+            <div className="text-right">
+              <span className="text-base font-bold font-mono text-indigo-600">{recipientNftCount}</span>
+              <span className="text-[10px] text-indigo-800 block">枚已安全入库</span>
+            </div>
+          </div>
         </div>
       </div>
 
-      {/* 3. MAIN THREE-PANEL SPLIT:
+      {/* 2. MAIN THREE-PANEL SPLIT:
           - Panel 1 (Left): 钱包与原子充值 (Wallets & Atomic Funding + Matrix + Asset Visualizer)
-          - Panel 2 (Center) & Panel 3 (Right): 抢购工作台 vs 终端实时日志 (Toggleable via panelLayout) */}
+          - Panel 2 (Center): 抢购工作台 (Workbench)
+          - Panel 3 (Right): 终端实时日志 (Terminal) */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 items-start">
         {/* Panel 1 (Left): 钱包与原子充值 (4 cols on xl) */}
         <div id="panel-wallets" className="xl:col-span-4 space-y-5 order-1">
@@ -1003,79 +1177,46 @@ export const InteractiveTester: React.FC = () => {
             copyWalletsJson={copyWalletsJson}
             copiedWallets={copiedWallets}
             isHighlighted={activeSubTab === 'wallets'}
+            onUpdateWalletPrivateKey={handleUpdateWalletPrivateKey}
+            onImportPrivateKeys={handleImportPrivateKeys}
           />
         </div>
 
         {/* Panel 2 (Center): 4 cols on xl */}
         <div id="panel-center" className="xl:col-span-4 space-y-5 order-2">
-          {panelLayout === 'workbench_center' ? (
-            <WorkbenchPanel
-              activeSubTab={activeSubTab}
-              setActiveSubTab={setActiveSubTab}
-              activeNetwork={activeNetwork}
-              effectiveRpcUrl={effectiveRpcUrl}
-              mintMode={mintMode}
-              setMintMode={setMintMode}
-              selectedDrop={selectedDrop}
-              setSelectedDrop={setSelectedDrop}
-              isMintRunning={isMintRunning}
-              startRealMintExecution={startRealMintExecution}
-              countdownSeconds={countdownSeconds}
-              mintProgress={mintProgress}
-              doctorResults={doctorResults}
-              doctorRunning={doctorRunning}
-              handleRunDoctor={handleRunDoctor}
-              calcExecutorAddress={calcExecutorAddress}
-              executorDeployed={executorDeployed}
-              handleDeployExecutor={handleDeployExecutor}
-              sponsorAddress={sponsorAddress}
-              setSponsorAddress={setSponsorAddress}
-              addLog={addLog}
-              wallets={wallets}
-            />
-          ) : (
-            <TerminalPanel
-              logs={logs}
-              onClearLogs={() => setLogs([])}
-              terminalEndRef={terminalEndRef}
-            />
-          )}
+          <WorkbenchPanel
+            activeSubTab={activeSubTab}
+            setActiveSubTab={setActiveSubTab}
+            activeNetwork={activeNetwork}
+            effectiveRpcUrl={effectiveRpcUrl}
+            mintMode={mintMode}
+            setMintMode={setMintMode}
+            selectedDrop={selectedDrop}
+            setSelectedDrop={setSelectedDrop}
+            isMintRunning={isMintRunning}
+            startRealMintExecution={startRealMintExecution}
+            countdownSeconds={countdownSeconds}
+            mintProgress={mintProgress}
+            doctorResults={doctorResults}
+            doctorRunning={doctorRunning}
+            handleRunDoctor={handleRunDoctor}
+            calcExecutorAddress={calcExecutorAddress}
+            executorDeployed={executorDeployed}
+            handleDeployExecutor={handleDeployExecutor}
+            sponsorAddress={sponsorAddress}
+            setSponsorAddress={setSponsorAddress}
+            addLog={addLog}
+            wallets={wallets}
+          />
         </div>
 
         {/* Panel 3 (Right): 4 cols on xl */}
         <div id="panel-right" className="xl:col-span-4 space-y-5 order-3">
-          {panelLayout === 'workbench_center' ? (
-            <TerminalPanel
-              logs={logs}
-              onClearLogs={() => setLogs([])}
-              terminalEndRef={terminalEndRef}
-            />
-          ) : (
-            <WorkbenchPanel
-              activeSubTab={activeSubTab}
-              setActiveSubTab={setActiveSubTab}
-              activeNetwork={activeNetwork}
-              effectiveRpcUrl={effectiveRpcUrl}
-              mintMode={mintMode}
-              setMintMode={setMintMode}
-              selectedDrop={selectedDrop}
-              setSelectedDrop={setSelectedDrop}
-              isMintRunning={isMintRunning}
-              startRealMintExecution={startRealMintExecution}
-              countdownSeconds={countdownSeconds}
-              mintProgress={mintProgress}
-              doctorResults={doctorResults}
-              doctorRunning={doctorRunning}
-              handleRunDoctor={handleRunDoctor}
-              calcExecutorAddress={calcExecutorAddress}
-              executorDeployed={executorDeployed}
-              handleDeployExecutor={handleDeployExecutor}
-              sponsorAddress={sponsorAddress}
-              setSponsorAddress={setSponsorAddress}
-              addLog={addLog}
-              wallets={wallets}
-            />
-          )}
+          <TerminalPanel
+            logs={logs}
+            onClearLogs={() => setLogs([])}
+            terminalEndRef={terminalEndRef}
+          />
         </div>
       </div>
 

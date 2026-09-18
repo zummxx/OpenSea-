@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Users,
   Wallet,
@@ -11,7 +11,10 @@ import {
   CheckCircle2,
   XCircle,
   ExternalLink,
-  Layers
+  Plus,
+  Edit3,
+  Save,
+  FileText
 } from 'lucide-react';
 import { TestWallet, NetworkConfig } from '../types';
 
@@ -52,6 +55,11 @@ interface WalletsFundPanelProps {
   copyWalletsJson: () => void;
   copiedWallets: boolean;
   isHighlighted?: boolean;
+  maxPerWallet?: number;
+  onUpdateWalletPrivateKey?: (walletId: number, newPrivateKey: string) => Promise<boolean>;
+  onImportPrivateKeys?: (keysText: string, mode: 'replace' | 'append') => Promise<boolean>;
+  onUpdateWalletQuantity?: (walletId: number, quantity: number) => void;
+  onBatchUpdateQuantity?: (quantity: number) => void;
 }
 
 export const WalletsFundPanel: React.FC<WalletsFundPanelProps> = ({
@@ -85,19 +93,81 @@ export const WalletsFundPanel: React.FC<WalletsFundPanelProps> = ({
   isSyncingBalances,
   copyWalletsJson,
   copiedWallets,
-  isHighlighted = false
+  isHighlighted = false,
+  maxPerWallet,
+  onUpdateWalletPrivateKey,
+  onImportPrivateKeys,
+  onUpdateWalletQuantity,
+  onBatchUpdateQuantity
 }) => {
+  const [editingWalletId, setEditingWalletId] = useState<number | null>(null);
+  const [tempPrivateKeyMap, setTempPrivateKeyMap] = useState<Record<number, string>>({});
+  const [showKeyMap, setShowKeyMap] = useState<Record<number, boolean>>({});
+  const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null);
+
+  // Import Drawer / Modal
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [importKeysText, setImportKeysText] = useState('');
+  const [importMode, setImportMode] = useState<'replace' | 'append'>('replace');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [saveStatusMsg, setSaveStatusMsg] = useState<{ id: number; text: string; isError?: boolean } | null>(null);
+
+  const toggleEditWalletKey = (walletId: number, currentKey: string) => {
+    if (editingWalletId === walletId) {
+      setEditingWalletId(null);
+      setSaveStatusMsg(null);
+    } else {
+      setEditingWalletId(walletId);
+      setTempPrivateKeyMap((prev) => ({ ...prev, [walletId]: currentKey }));
+      setSaveStatusMsg(null);
+    }
+  };
+
+  const toggleKeyVisibility = (walletId: number) => {
+    setShowKeyMap((prev) => ({ ...prev, [walletId]: !prev[walletId] }));
+  };
+
+  const copyWalletPrivateKey = (walletId: number, key: string) => {
+    navigator.clipboard.writeText(key);
+    setCopiedKeyId(walletId);
+    setTimeout(() => setCopiedKeyId(null), 2000);
+  };
+
+  const handleSaveWalletKey = async (walletId: number, newKey: string) => {
+    if (!onUpdateWalletPrivateKey) return;
+    setIsSubmitting(true);
+    setSaveStatusMsg(null);
+    const success = await onUpdateWalletPrivateKey(walletId, newKey);
+    setIsSubmitting(false);
+    if (success) {
+      setSaveStatusMsg({ id: walletId, text: '私钥更新成功，已计算真实地址并同步链上余额！' });
+      setTimeout(() => {
+        setEditingWalletId(null);
+        setSaveStatusMsg(null);
+      }, 1800);
+    } else {
+      setSaveStatusMsg({ id: walletId, text: '私钥格式无效，需为 64 位十六进制字符', isError: true });
+    }
+  };
+
+  const handleExecuteImport = async () => {
+    if (!onImportPrivateKeys || !importKeysText.trim()) return;
+    setIsSubmitting(true);
+    const success = await onImportPrivateKeys(importKeysText, importMode);
+    setIsSubmitting(false);
+    if (success) {
+      setImportKeysText('');
+      setIsImportModalOpen(false);
+    }
+  };
+
   return (
     <div className={`space-y-5 transition-all duration-300 ${isHighlighted ? 'ring-2 ring-emerald-500/50 rounded-2xl' : ''}`}>
       {/* 1. 钱包与主网资金实操控制台 */}
       <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-100 gap-2">
+        <div className="flex items-center justify-between pb-3 border-b border-slate-100 gap-2">
           <div className="flex items-center space-x-2">
             <Users className="w-5 h-5 text-emerald-600" />
-            <h3 className="font-bold text-slate-900 text-sm md:text-base">钱包与主网资金实操</h3>
-            <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 shrink-0">
-              ● 100% 真实主网
-            </span>
           </div>
           <div className="flex items-center space-x-1.5">
             <button
@@ -260,7 +330,18 @@ export const WalletsFundPanel: React.FC<WalletsFundPanelProps> = ({
           <div className="p-3 rounded-xl border border-slate-200 bg-slate-50 space-y-2 text-xs">
             <div className="flex items-center justify-between">
               <span className="font-bold text-slate-800">批量加密生成 EOA</span>
-              <span className="text-[10px] text-slate-500">Secp256k1</span>
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setIsImportModalOpen(true)}
+                  className="text-[11px] text-emerald-600 hover:text-emerald-700 font-medium flex items-center space-x-0.5 cursor-pointer"
+                >
+                  <Plus className="w-3 h-3" />
+                  <span>导入自定义私钥</span>
+                </button>
+                <span className="text-[10px] text-slate-400">|</span>
+                <span className="text-[10px] text-slate-500">Secp256k1</span>
+              </div>
             </div>
             <div className="flex items-center space-x-2">
               <input
@@ -346,141 +427,351 @@ export const WalletsFundPanel: React.FC<WalletsFundPanelProps> = ({
             <Users className="w-4 h-4 text-slate-700" />
             <h4 className="font-bold text-slate-900 text-xs md:text-sm">测试子钱包列表 ({wallets.length} 个)</h4>
           </div>
-          <span className="text-[11px] text-slate-500 font-mono">
-            总额: {wallets.reduce((acc, w) => acc + w.nativeBalance, 0).toFixed(4)} {activeNetwork.currency}
-          </span>
-        </div>
-
-        <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-slate-200">
-          {wallets.map((w) => (
-            <div
-              key={w.id}
-              className="flex items-center justify-between p-2.5 rounded-xl border border-slate-100 bg-slate-50/70 hover:bg-slate-100/80 transition-all text-xs"
+          <div className="flex items-center space-x-2">
+            <button
+              type="button"
+              onClick={() => setIsImportModalOpen(!isImportModalOpen)}
+              className="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-semibold flex items-center space-x-1 cursor-pointer transition-all shadow-2xs"
+              title="导入自定义已有私钥"
             >
-              <div className="flex items-center space-x-2">
-                <span className="w-5 h-5 rounded-full bg-slate-900 text-white font-mono text-[10px] font-bold flex items-center justify-center shrink-0">
-                  {w.id}
-                </span>
-                <div className="min-w-0">
-                  <div className="flex items-center space-x-1.5">
-                    <span className="font-mono font-bold text-slate-800 truncate">
-                      {w.address.slice(0, 6)}...{w.address.slice(-4)}
-                    </span>
-                    {w.isDelegated ? (
-                      <span className="text-[9px] bg-indigo-100 text-indigo-700 px-1 py-0.2 rounded font-mono shrink-0">
-                        7702
-                      </span>
-                    ) : (
-                      <span className="text-[9px] bg-slate-200 text-slate-600 px-1 py-0.2 rounded font-mono shrink-0">
-                        EOA
-                      </span>
-                    )}
-                  </div>
-                  <span className="text-[10.5px] text-slate-500 font-mono block">
-                    {w.nativeBalance.toFixed(4)} {activeNetwork.currency}
-                  </span>
-                </div>
-              </div>
-
-              <div className="flex items-center space-x-1.5 shrink-0">
-                {w.status === 'idle' && (
-                  <span className="px-2 py-0.5 rounded-full bg-slate-200 text-slate-700 text-[10px] font-mono">
-                    待命
-                  </span>
-                )}
-                {w.status === 'ready' && (
-                  <span className="px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 text-[10px] font-mono animate-pulse">
-                    锁定
-                  </span>
-                )}
-                {w.status === 'fetching_calldata' && (
-                  <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-mono animate-pulse">
-                    抓取
-                  </span>
-                )}
-                {w.status === 'broadcasting' && (
-                  <span className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800 text-[10px] font-mono animate-pulse">
-                    广播中
-                  </span>
-                )}
-                {w.status === 'success' && (
-                  <div className="flex flex-col items-end space-y-0.5">
-                    <div className="flex items-center space-x-1 text-emerald-600 font-mono text-[10.5px] font-bold">
-                      <CheckCircle2 className="w-3 h-3" />
-                      <span>{w.mintedNftCount} 枚</span>
-                    </div>
-                    {w.txHash && (
-                      <a
-                        href={`${activeNetwork.explorerUrl}/tx/${w.txHash}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-[9.5px] text-sky-600 hover:text-sky-800 hover:underline font-mono flex items-center space-x-0.5"
-                      >
-                        <span>{w.txHash.slice(0, 6)}...</span>
-                        <ExternalLink className="w-2 h-2" />
-                      </a>
-                    )}
-                  </div>
-                )}
-                {w.status === 'reverted' && (
-                  <div className="flex flex-col items-end space-y-0.5">
-                    <div className="flex items-center space-x-1 text-rose-600 font-mono text-[10.5px]">
-                      <XCircle className="w-3 h-3" />
-                      <span>{w.errorMsg || '回滚'}</span>
-                    </div>
-                    {w.txHash && (
-                      <a
-                        href={`${activeNetwork.explorerUrl}/tx/${w.txHash}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-[9.5px] text-slate-500 hover:underline font-mono flex items-center space-x-0.5"
-                      >
-                        <span>{w.txHash.slice(0, 6)}...</span>
-                        <ExternalLink className="w-2 h-2" />
-                      </a>
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* 3. 链上资金与 NFT 原子流向看板 */}
-      <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs space-y-2.5">
-        <div className="flex items-center space-x-2 text-xs font-bold text-slate-800">
-          <Layers className="w-4 h-4 text-emerald-600" />
-          <span>链上资金与 NFT 原子流向</span>
-        </div>
-
-        <div className="space-y-2 text-xs">
-          <div className="flex items-center justify-between p-2 rounded-lg bg-slate-50 border border-slate-100">
-            <span className="text-slate-500">代付钱包 (Sponsor)</span>
-            <span className="font-mono font-bold text-slate-900">
-              {sponsorBalance.toFixed(4)} {activeNetwork.currency}
+              <Plus className="w-3.5 h-3.5" />
+              <span>导入私钥</span>
+            </button>
+            <span className="text-[11px] text-slate-500 font-mono">
+              总额: {wallets.reduce((acc, w) => acc + w.nativeBalance, 0).toFixed(4)} {activeNetwork.currency}
             </span>
           </div>
+        </div>
 
-          <div className="flex items-center justify-between p-2 rounded-lg bg-slate-50 border border-slate-100">
-            <span className="text-slate-500">子钱包汇总资金</span>
-            <span className="font-mono font-bold text-slate-900">
-              {wallets.reduce((sum, w) => sum + w.nativeBalance, 0).toFixed(4)} {activeNetwork.currency}
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between p-2.5 rounded-lg bg-indigo-50 border border-indigo-100">
-            <div>
-              <span className="text-indigo-900 font-bold block">最终 NFT 归集主地址</span>
-              <span className="text-[10px] font-mono text-indigo-700 truncate max-w-[140px] block">
-                {recipientAddress ? `${recipientAddress.slice(0, 10)}...${recipientAddress.slice(-6)}` : '未设置'}
+        {/* Import Drawer Panel */}
+        {isImportModalOpen && (
+          <div className="p-3.5 bg-emerald-50/70 rounded-xl border border-emerald-200 space-y-2.5 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-emerald-950 flex items-center space-x-1.5">
+                <Key className="w-3.5 h-3.5 text-emerald-600" />
+                <span>导入已有钱包私钥 (单个或每行一个批量导入)</span>
               </span>
+              <button
+                type="button"
+                onClick={() => setIsImportModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 cursor-pointer p-0.5"
+              >
+                ✕
+              </button>
             </div>
-            <div className="text-right">
-              <span className="text-base font-bold font-mono text-indigo-600">{recipientNftCount}</span>
-              <span className="text-[10px] text-indigo-800 block">枚已安全入库</span>
+            <textarea
+              rows={3}
+              value={importKeysText}
+              onChange={(e) => setImportKeysText(e.target.value)}
+              placeholder="在此粘贴拥有余额的私钥 (支持 0x 开头或纯 64 位十六进制，多私钥换行粘贴)..."
+              className="w-full p-2 bg-white border border-slate-200 rounded-lg font-mono text-xs text-slate-900 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
+            />
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+              <div className="flex items-center space-x-3 text-[11px] text-slate-700">
+                <label className="flex items-center space-x-1 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="importMode"
+                    checked={importMode === 'replace'}
+                    onChange={() => setImportMode('replace')}
+                    className="text-emerald-600"
+                  />
+                  <span>替换当前子钱包</span>
+                </label>
+                <label className="flex items-center space-x-1 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="importMode"
+                    checked={importMode === 'append'}
+                    onChange={() => setImportMode('append')}
+                    className="text-emerald-600"
+                  />
+                  <span>追加到列表</span>
+                </label>
+              </div>
+
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setIsImportModalOpen(false)}
+                  className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium cursor-pointer"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={!importKeysText.trim() || isSubmitting}
+                  onClick={handleExecuteImport}
+                  className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-medium cursor-pointer shadow-xs transition-all"
+                >
+                  {isSubmitting ? '解析导入中...' : '确认导入私钥'}
+                </button>
+              </div>
             </div>
           </div>
+        )}
+
+        {/* Batch Quantity Controller */}
+        <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 bg-emerald-50/80 border border-emerald-200 rounded-xl text-xs">
+          <div className="flex items-center space-x-2">
+            <span className="text-emerald-900 font-semibold text-[11px]">每个钱包抢购数量:</span>
+            <div className="flex items-center space-x-1 bg-white border border-emerald-300 rounded px-1.5 py-0.5 shadow-2xs">
+              <button
+                type="button"
+                onClick={() => {
+                  const currentVal = wallets[0]?.quantity || 1;
+                  if (currentVal > 1) {
+                    onBatchUpdateQuantity?.(currentVal - 1);
+                  }
+                }}
+                className="w-4 h-4 rounded text-slate-700 hover:bg-slate-100 flex items-center justify-center font-bold text-xs cursor-pointer"
+              >
+                -
+              </button>
+              <span className="font-mono font-bold text-emerald-800 text-xs min-w-[20px] text-center">
+                {wallets[0]?.quantity || 1}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const currentVal = wallets[0]?.quantity || 1;
+                  const limit = maxPerWallet && maxPerWallet > 0 ? maxPerWallet : 100;
+                  if (currentVal < limit) {
+                    onBatchUpdateQuantity?.(currentVal + 1);
+                  }
+                }}
+                className="w-4 h-4 rounded text-slate-700 hover:bg-slate-100 flex items-center justify-center font-bold text-xs cursor-pointer"
+              >
+                +
+              </button>
+            </div>
+            <span className="text-emerald-700 text-[10.5px]">枚 / 钱包</span>
+          </div>
+
+          {maxPerWallet && maxPerWallet > 0 ? (
+            <button
+              type="button"
+              onClick={() => onBatchUpdateQuantity?.(maxPerWallet)}
+              className="text-[10.5px] bg-emerald-600 hover:bg-emerald-500 text-white font-medium px-2 py-0.5 rounded shadow-2xs transition-all active:scale-95 cursor-pointer"
+              title="按合约公开限额拉满全部子钱包抢购数量"
+            >
+              按限额一键拉满 ({maxPerWallet} 枚)
+            </button>
+          ) : null}
+        </div>
+
+        <div className="space-y-2 max-h-80 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-slate-200">
+          {wallets.map((w) => {
+            const isEditing = editingWalletId === w.id;
+            const currentTempKey = tempPrivateKeyMap[w.id] ?? w.privateKey;
+            const isVisible = !!showKeyMap[w.id];
+
+            return (
+              <div
+                key={w.id}
+                className="p-2.5 rounded-xl border border-slate-200 bg-slate-50/70 hover:bg-slate-100/80 transition-all text-xs space-y-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center space-x-2 min-w-0">
+                    <span className="w-5 h-5 rounded-full bg-slate-900 text-white font-mono text-[10px] font-bold flex items-center justify-center shrink-0">
+                      {w.id}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="flex items-center space-x-1.5">
+                        <span className="font-mono font-bold text-slate-800 truncate" title={w.address}>
+                          {w.address.slice(0, 6)}...{w.address.slice(-4)}
+                        </span>
+                        {w.isDelegated ? (
+                          <span className="text-[9px] bg-indigo-100 text-indigo-700 px-1 py-0.2 rounded font-mono shrink-0">
+                            7702
+                          </span>
+                        ) : (
+                          <span className="text-[9px] bg-slate-200 text-slate-600 px-1 py-0.2 rounded font-mono shrink-0">
+                            EOA
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-[10.5px] text-slate-500 font-mono block">
+                        {w.nativeBalance.toFixed(4)} {activeNetwork.currency}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center space-x-1.5 shrink-0">
+                    {/* Per-wallet quantity selector */}
+                    <div className="flex items-center space-x-1 bg-white border border-slate-200 rounded px-1.5 py-0.5 shadow-2xs" title="该子钱包计划抢购数量">
+                      <span className="text-[10px] text-slate-500 font-medium">数量:</span>
+                      <button
+                        type="button"
+                        onClick={() => onUpdateWalletQuantity?.(w.id, Math.max(1, w.quantity - 1))}
+                        disabled={w.quantity <= 1}
+                        className="w-4 h-4 rounded text-slate-600 hover:bg-slate-100 flex items-center justify-center font-bold text-[10px] disabled:opacity-30 cursor-pointer"
+                      >
+                        -
+                      </button>
+                      <span className="font-mono font-bold text-slate-800 text-[11px] min-w-[14px] text-center">
+                        {w.quantity}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const limit = maxPerWallet && maxPerWallet > 0 ? maxPerWallet : 100;
+                          if (w.quantity < limit) {
+                            onUpdateWalletQuantity?.(w.id, w.quantity + 1);
+                          }
+                        }}
+                        className="w-4 h-4 rounded text-slate-600 hover:bg-slate-100 flex items-center justify-center font-bold text-[10px] cursor-pointer"
+                      >
+                        +
+                      </button>
+                    </div>
+
+                    {/* Key Management Button */}
+                    <button
+                      type="button"
+                      onClick={() => toggleEditWalletKey(w.id, w.privateKey)}
+                      className={`px-2 py-0.5 rounded-md border text-[11px] font-medium flex items-center space-x-1 cursor-pointer transition-all ${
+                        isEditing
+                          ? 'bg-amber-100 border-amber-300 text-amber-900'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-100'
+                      }`}
+                      title="查看或修改此子钱包私钥"
+                    >
+                      <Key className="w-3 h-3 text-amber-600" />
+                      <span>{isEditing ? '收起私钥' : '设置私钥'}</span>
+                    </button>
+
+                    {w.status === 'idle' && (
+                      <span className="px-2 py-0.5 rounded-full bg-slate-200 text-slate-700 text-[10px] font-mono">
+                        待命
+                      </span>
+                    )}
+                    {w.status === 'ready' && (
+                      <span className="px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 text-[10px] font-mono animate-pulse">
+                        锁定
+                      </span>
+                    )}
+                    {w.status === 'fetching_calldata' && (
+                      <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-mono animate-pulse">
+                        抓取
+                      </span>
+                    )}
+                    {w.status === 'broadcasting' && (
+                      <span className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800 text-[10px] font-mono animate-pulse">
+                        广播中
+                      </span>
+                    )}
+                    {w.status === 'success' && (
+                      <div className="flex flex-col items-end space-y-0.5">
+                        <div className="flex items-center space-x-1 text-emerald-600 font-mono text-[10.5px] font-bold">
+                          <CheckCircle2 className="w-3 h-3" />
+                          <span>{w.mintedNftCount} 枚</span>
+                        </div>
+                        {w.txHash && (
+                          <a
+                            href={`${activeNetwork.explorerUrl}/tx/${w.txHash}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-[9.5px] text-sky-600 hover:text-sky-800 hover:underline font-mono flex items-center space-x-0.5"
+                          >
+                            <span>{w.txHash.slice(0, 6)}...</span>
+                            <ExternalLink className="w-2 h-2" />
+                          </a>
+                        )}
+                      </div>
+                    )}
+                    {w.status === 'reverted' && (
+                      <div className="flex flex-col items-end space-y-0.5">
+                        <div className="flex items-center space-x-1 text-rose-600 font-mono text-[10.5px]">
+                          <XCircle className="w-3 h-3" />
+                          <span>{w.errorMsg || '回滚'}</span>
+                        </div>
+                        {w.txHash && (
+                          <a
+                            href={`${activeNetwork.explorerUrl}/tx/${w.txHash}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-[9.5px] text-slate-500 hover:underline font-mono flex items-center space-x-0.5"
+                          >
+                            <span>{w.txHash.slice(0, 6)}...</span>
+                            <ExternalLink className="w-2 h-2" />
+                          </a>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Inline Private Key Editor */}
+                {isEditing && (
+                  <div className="p-2.5 rounded-lg bg-amber-50/70 border border-amber-200 space-y-2 text-xs animate-in fade-in">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-slate-800 flex items-center space-x-1 text-[11px]">
+                        <Key className="w-3 h-3 text-amber-600" />
+                        <span>子钱包 #{w.id} 专用私钥 (可直接粘贴自定义私钥)</span>
+                      </span>
+                      <div className="flex items-center space-x-2 text-[10.5px]">
+                        <button
+                          type="button"
+                          onClick={() => toggleKeyVisibility(w.id)}
+                          className="text-slate-600 hover:text-slate-900 flex items-center space-x-0.5 cursor-pointer"
+                        >
+                          {isVisible ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                          <span>{isVisible ? '隐藏' : '明文'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => copyWalletPrivateKey(w.id, w.privateKey)}
+                          className="text-slate-600 hover:text-slate-900 flex items-center space-x-0.5 cursor-pointer"
+                        >
+                          {copiedKeyId === w.id ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                          <span>{copiedKeyId === w.id ? '已复制' : '复制当前'}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <input
+                        type={isVisible ? 'text' : 'password'}
+                        value={currentTempKey}
+                        onChange={(e) => setTempPrivateKeyMap((prev) => ({ ...prev, [w.id]: e.target.value }))}
+                        placeholder="粘贴 0x 开头 64 位十六进制私钥..."
+                        className="w-full px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg font-mono text-xs text-slate-900 focus:ring-1 focus:ring-amber-500 focus:outline-none"
+                      />
+
+                      {saveStatusMsg && saveStatusMsg.id === w.id && (
+                        <p className={`text-[10.5px] font-medium ${saveStatusMsg.isError ? 'text-rose-600' : 'text-emerald-700'}`}>
+                          {saveStatusMsg.text}
+                        </p>
+                      )}
+
+                      <div className="flex items-center justify-between text-[10.5px] pt-0.5">
+                        <span className="text-slate-500">保存后自动计算真实地址并向节点拉取余额</span>
+                        <div className="flex items-center space-x-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setEditingWalletId(null)}
+                            className="px-2 py-0.5 rounded bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 cursor-pointer"
+                          >
+                            取消
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isSubmitting || currentTempKey === w.privateKey || !currentTempKey.trim()}
+                            onClick={() => handleSaveWalletKey(w.id, currentTempKey)}
+                            className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white rounded font-medium flex items-center space-x-1 cursor-pointer transition-all shadow-2xs"
+                          >
+                            <Save className="w-3 h-3" />
+                            <span>{isSubmitting ? '保存解析中...' : '保存并应用私钥'}</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>

@@ -93,4 +93,13 @@ export interface DropInfo {
   contractAddress: string;
   mintPrice: number;
   activeStage: string;
+  maxPerWallet?: number;
+  mintQuantity?: number; // Target quantity to mint per wallet
+  startTime?: number;
+  endTime?: number;
+  saleStatusText?: string;
+  isSeaDropDetected?: boolean;
+  mintMethod?: string; // 'mint' | 'mintPublic' | 'seadrop' | 'custom' | 'transfer'
+  customCalldata?: string;
+  gasPriceGwei?: number; // Optional user specified or boosted Gas Price (Gwei)
 }
